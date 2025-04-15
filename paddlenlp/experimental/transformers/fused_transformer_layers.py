@@ -5662,7 +5662,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
             # Fused-OP-2 end
 
             # all_reduce
-            if self.nranks > 1:
+            if self.tp_degree > 1:
                 dist.all_reduce(out_linear_out)
             out_linear_out = residual_input + out_linear_out
             residual_input = out_linear_out
@@ -5678,7 +5678,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
             # Fused-OP-4 end
 
             # all_reduce
-            if self.nranks > 1:
+            if self.tp_degree > 1:
                 dist.all_reduce(ffn2_out)
             src = residual_input + ffn2_out
             # end LlamaDecoderLayer
