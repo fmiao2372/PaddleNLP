@@ -20,7 +20,7 @@ from typing import List
 import numpy as np
 import paddle
 
-if not paddle.is_compiled_with_xpu():
+if not paddle.is_compiled_with_xpu() and False:
     from paddlenlp_ops import (
         draft_model_postprocess,
         draft_model_preprocess,

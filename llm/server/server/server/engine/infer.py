@@ -27,17 +27,24 @@ import paddle
 import paddle.distributed as dist
 import paddle.distributed.fleet as fleet
 from paddle.base.framework import use_pir_api
-from paddlenlp_ops import step_paddle
-if not paddle.is_compiled_with_xpu():
-    from paddlenlp_ops import speculate_step_paddle
+# from paddlenlp_ops import step_paddle
 from server.data.processor import DataProcessor
 from server.engine.config import global_config
 from server.utils import get_logger
 from task_queue_manager import TaskQueueManager
+from dataclasses import dataclass, field
+from typing import List
 
 from paddlenlp.experimental.transformers import (
     EagleProposer,
     InferenceWithReferenceProposer,
+)
+from paddlenlp.transformers import (
+    AutoConfig,
+    AutoInferenceModelForCausalLM,
+    AutoTokenizer,
+    Llama3Tokenizer,
+    LlamaTokenizer,
 )
 from paddlenlp.trl import llm_utils
 from paddlenlp.trl.llm_utils import get_rotary_position_embedding
@@ -56,8 +63,10 @@ class ModelRunner:
 
         self.config = global_config
         self.model_cfg = self.config.get_model_config()
+        logger.info(str(self.model_cfg))
         self.speculate_config = self.config.get_speculate_config()
-        self.is_speculate_decoding = self.speculate_config.speculate_method != "None"
+        # self.is_speculate_decoding = self.speculate_config.speculate_method != "None"
+        self.is_speculate_decoding = False
         self.format_print_configuration()
 
         self.args.num_layers = self.get_value(self.model_cfg, ["num_hidden_layers", "num_layers"])
@@ -81,7 +90,7 @@ class ModelRunner:
 
         self.share_inputs = {}
         self.helper_tensors = {}
-        self.cache_kvs = {}
+        self.cache_kvs = []
         self.init_inputs()
 
         if self.is_speculate_decoding:
@@ -93,8 +102,8 @@ class ModelRunner:
                     self.args.max_batch_size,
                     self.args.max_seq_len,
                 )
-            elif self.speculate_config.speculate_method in ["eagle", "mtp"]:
-                self.proposer = EagleProposer(self.speculate_config, base_model_inputs=self.share_inputs)
+            # elif self.speculate_config.speculate_method in ["eagle", "mtp"]:
+            #     self.proposer = EagleProposer(self.speculate_config, base_model_inputs=self.share_inputs)
         else:
             self.proposer = None
 
@@ -104,16 +113,12 @@ class ModelRunner:
         if not os.path.exists(model_rank_path):
             model_rank_path = self.args.model_dir
 
-        self.infer_engine = InferenceEngine(
+        self.dygraph_block_inference_predictor = DygraphBlockInferencePredictor(
             model_dir=model_rank_path,
-            share_inputs=self.share_inputs,
-            cache_kvs=self.cache_kvs,
-            config=self.config,
-            mp_degree=self.nranks,
-        )
+            dtype=self.args.dtype)
 
-        if self.config.return_full_hidden_states:
-            self.set_inputs()
+        # if self.config.return_full_hidden_states:
+        #     self.set_inputs()
 
     def read_model_config(self):
         """
@@ -204,7 +209,7 @@ class ModelRunner:
 
             if "deepseek" in self.model_cfg["model_type"]:
                 if self.mla_use_absorb:
-                    self.cache_kvs["key_caches_{}".format(i)] = paddle.full(
+                    self.cache_kvs.append(paddle.full(
                         shape=[
                             self.args.max_block_num,
                             1,
@@ -213,9 +218,9 @@ class ModelRunner:
                         ],
                         fill_value=0,
                         dtype=cache_type,
-                    )
+                    ))
                 else:
-                    self.cache_kvs["key_caches_{}".format(i)] = paddle.full(
+                    self.cache_kvs.append(paddle.full(
                         shape=[
                             self.args.max_block_num,
                             kv_num_head,
@@ -224,14 +229,14 @@ class ModelRunner:
                         ],
                         fill_value=0,
                         dtype=cache_type,
-                    )
-                    self.cache_kvs["value_caches_{}".format(i)] = paddle.full(
+                    ))
+                    self.cache_kvs.append(paddle.full(
                         shape=[self.args.max_block_num, kv_num_head, self.args.block_size, self.v_head_dim],
                         fill_value=0,
                         dtype=cache_type,
-                    )
+                    ))
             else:
-                self.cache_kvs["key_caches_{}".format(i)] = paddle.full(
+                self.cache_kvs.append(paddle.full(
                     shape=[
                         self.args.max_block_num,
                         kv_num_head,
@@ -240,8 +245,8 @@ class ModelRunner:
                     ],
                     fill_value=0,
                     dtype=cache_type,
-                )
-                self.cache_kvs["value_caches_{}".format(i)] = paddle.full(
+                ))
+                self.cache_kvs.append(paddle.full(
                     shape=[
                         self.args.max_block_num,
                         kv_num_head,
@@ -250,7 +255,7 @@ class ModelRunner:
                     ],
                     fill_value=0,
                     dtype=cache_type,
-                )
+                ))
 
         pre_max_block_num = (
             self.args.max_seq_len + self.args.block_size - 1
@@ -387,22 +392,22 @@ class ModelRunner:
             )
             self.helper_tensors["full_hidden_states"] = None
 
-    def set_inputs(self):
-        for i in range(self.args.num_layers):
-            if not self.mla_use_absorb:
-                self.share_inputs["value_caches_{}".format(i)] = self.cache_kvs["value_caches_{}".format(i)]
-            self.share_inputs["key_caches_{}".format(i)] = self.cache_kvs["key_caches_{}".format(i)]
+    # def set_inputs(self):
+    #     for i in range(self.args.num_layers):
+    #         if not self.mla_use_absorb:
+    #             self.share_inputs["value_caches_{}".format(i)] = self.cache_kvs["value_caches_{}".format(i)]
+    #         self.share_inputs["key_caches_{}".format(i)] = self.cache_kvs["key_caches_{}".format(i)]
 
-        self.input_tensors = []
-        share_inputs_keys = self.share_inputs.keys()
-        for k in self.infer_engine.input_names:
-            assert k in share_inputs_keys, f"Input {k} must be created."
-            if k != "seq_lens_this_time":
-                v = self.share_inputs[k]
-                v.name = k
-                self.input_tensors.append(v)
-        # seq_lens_this_time need to be replaced in insert step
-        self.input_tensors.append("None")
+    #     self.input_tensors = []
+    #     share_inputs_keys = self.share_inputs.keys()
+    #     for k in self.infer_engine.input_names:
+    #         assert k in share_inputs_keys, f"Input {k} must be created."
+    #         if k != "seq_lens_this_time":
+    #             v = self.share_inputs[k]
+    #             v.name = k
+    #             self.input_tensors.append(v)
+    #     # seq_lens_this_time need to be replaced in insert step
+    #     self.input_tensors.append("None")
 
     def dy_input_preprocess(self, tasks):
         """
@@ -475,62 +480,63 @@ class ModelRunner:
         step cuda
         """
 
-        if self.is_speculate_decoding:
-            speculate_step_paddle(
-                self.share_inputs["stop_flags"],
-                self.share_inputs["seq_lens_this_time"],
-                self.share_inputs["step_seq_lens_encoder"],
-                self.share_inputs["seq_lens_encoder"],
-                self.share_inputs["seq_lens_decoder"],
-                self.share_inputs["block_tables"],
-                self.share_inputs["encoder_block_lens"],
-                self.share_inputs["is_block_step"],
-                self.share_inputs["step_block_list"],
-                self.share_inputs["step_lens"],
-                self.share_inputs["recover_block_list"],
-                self.share_inputs["recover_lens"],
-                self.share_inputs["need_block_list"],
-                self.share_inputs["need_block_len"],
-                self.share_inputs["used_list_len"],
-                self.share_inputs["free_list"],
-                self.share_inputs["free_list_len"],
-                self.share_inputs["input_ids"],
-                self.share_inputs["pre_ids"],
-                self.share_inputs["step_idx"],
-                self.share_inputs["next_tokens"],
-                self.share_inputs["first_token_ids"],
-                self.share_inputs["accept_num"],
-                self.args.block_size,
-                self.args.enc_dec_block_num,
-                self.speculate_config.speculate_max_draft_token_num,
-            )
-        else:
-            step_paddle(
-                self.share_inputs["stop_flags"],
-                self.share_inputs["seq_lens_this_time"],
-                self.share_inputs["step_seq_lens_encoder"],
-                self.share_inputs["seq_lens_encoder"],
-                self.share_inputs["seq_lens_decoder"],
-                self.share_inputs["block_tables"],
-                self.share_inputs["encoder_block_lens"],
-                self.share_inputs["is_block_step"],
-                self.share_inputs["step_block_list"],
-                self.share_inputs["step_lens"],
-                self.share_inputs["recover_block_list"],
-                self.share_inputs["recover_lens"],
-                self.share_inputs["need_block_list"],
-                self.share_inputs["need_block_len"],
-                self.share_inputs["used_list_len"],
-                self.share_inputs["free_list"],
-                self.share_inputs["free_list_len"],
-                self.share_inputs["input_ids"],
-                self.share_inputs["pre_ids"],
-                self.share_inputs["step_idx"],
-                self.share_inputs["next_tokens"],
-                self.share_inputs["first_token_ids"],
-                self.args.block_size,
-                self.args.enc_dec_block_num,
-            )
+        # if self.is_speculate_decoding:
+        #     speculate_step_paddle(
+        #         self.share_inputs["stop_flags"],
+        #         self.share_inputs["seq_lens_this_time"],
+        #         self.share_inputs["step_seq_lens_encoder"],
+        #         self.share_inputs["seq_lens_encoder"],
+        #         self.share_inputs["seq_lens_decoder"],
+        #         self.share_inputs["block_tables"],
+        #         self.share_inputs["encoder_block_lens"],
+        #         self.share_inputs["is_block_step"],
+        #         self.share_inputs["step_block_list"],
+        #         self.share_inputs["step_lens"],
+        #         self.share_inputs["recover_block_list"],
+        #         self.share_inputs["recover_lens"],
+        #         self.share_inputs["need_block_list"],
+        #         self.share_inputs["need_block_len"],
+        #         self.share_inputs["used_list_len"],
+        #         self.share_inputs["free_list"],
+        #         self.share_inputs["free_list_len"],
+        #         self.share_inputs["input_ids"],
+        #         self.share_inputs["pre_ids"],
+        #         self.share_inputs["step_idx"],
+        #         self.share_inputs["next_tokens"],
+        #         self.share_inputs["first_token_ids"],
+        #         self.share_inputs["accept_num"],
+        #         self.args.block_size,
+        #         self.args.enc_dec_block_num,
+        #         self.speculate_config.speculate_max_draft_token_num,
+        #     )
+        # else:
+        #     step_paddle(
+        #         self.share_inputs["stop_flags"],
+        #         self.share_inputs["seq_lens_this_time"],
+        #         self.share_inputs["step_seq_lens_encoder"],
+        #         self.share_inputs["seq_lens_encoder"],
+        #         self.share_inputs["seq_lens_decoder"],
+        #         self.share_inputs["block_tables"],
+        #         self.share_inputs["encoder_block_lens"],
+        #         self.share_inputs["is_block_step"],
+        #         self.share_inputs["step_block_list"],
+        #         self.share_inputs["step_lens"],
+        #         self.share_inputs["recover_block_list"],
+        #         self.share_inputs["recover_lens"],
+        #         self.share_inputs["need_block_list"],
+        #         self.share_inputs["need_block_len"],
+        #         self.share_inputs["used_list_len"],
+        #         self.share_inputs["free_list"],
+        #         self.share_inputs["free_list_len"],
+        #         self.share_inputs["input_ids"],
+        #         self.share_inputs["pre_ids"],
+        #         self.share_inputs["step_idx"],
+        #         self.share_inputs["next_tokens"],
+        #         self.share_inputs["first_token_ids"],
+        #         self.args.block_size,
+        #         self.args.enc_dec_block_num,
+        #     )
+        pass
 
     def initialize_engine_ready_check_flag(self):
         """
@@ -658,8 +664,8 @@ class ModelRunner:
                 if self.config.return_full_hidden_states:
                     self.share_inputs["seq_lens_this_time"].name = "seq_lens_this_time"
                     self.input_tensors[-1] = self.share_inputs["seq_lens_this_time"]
-                if not self.config.return_full_hidden_states:
-                    self.infer_engine.seq_lens_handle.share_external_data(self.share_inputs["seq_lens_this_time"])
+                # if not self.config.return_full_hidden_states:
+                #     self.infer_engine.seq_lens_handle.share_external_data(self.share_inputs["seq_lens_this_time"])
                 self.share_inputs["not_need_stop"][0] = True
 
             if not self.share_inputs["not_need_stop"]:
@@ -678,96 +684,211 @@ class ModelRunner:
                     insert_step=self.insert_step,
                 )
 
+            self.share_inputs["cache_kvs"] = self.cache_kvs
             if self.config.return_full_hidden_states:
-                outputs = self.infer_engine.predictor.run(self.input_tensors)
+                outputs = self.dygraph_block_inference_predictor._infer(self.share_inputs)
                 self.helper_tensors["full_hidden_states"] = outputs[0]
             else:
-                self.infer_engine.predictor.run()
+                self.dygraph_block_inference_predictor._infer(self.share_inputs)
 
             self.share_inputs["infer_seed"].add_(infer_seed_increment)
             self.share_inputs["infer_seed"][:] %= self.MAX_INFER_SEED
             if self.free_list_len > 0:
                 self.step_cuda()
 
-            if self.proposer is not None:
-                self.proposer.postprocess()
+@dataclass
+class PredictorArgument:
+    model_name_or_path: str = field(default=None, metadata={"help": "The directory of model."})
+    model_prefix: str = field(default="model", metadata={"help": "the prefix name of static model"})
+    src_length: int = field(default=1024, metadata={"help": "The max length of source text."})
+    min_length: int = field(default=1, metadata={"help": "the min length for decoding."})
+    max_length: int = field(default=1024, metadata={"help": "the max length for decoding."})
+    top_k: int = field(default=0, metadata={"help": "top_k parameter for generation"})
+    top_p: float = field(default=0.7, metadata={"help": "top_p parameter for generation"})
+    temperature: float = field(default=0.95, metadata={"help": "top_p parameter for generation"})
+    repetition_penalty: float = field(default=1.0, metadata={"help": "repetition penalty parameter for generation"})
+    device: str = field(default="gpu", metadata={"help": "Device"})
+    dtype: str = field(default=None, metadata={"help": "Model dtype"})
+    lora_path: str = field(default=None, metadata={"help": "The directory of LoRA parameters. Default to None"})
+    export_precache: bool = field(default=False, metadata={"help": "whether use prefix weight to do infer"})
+    prefix_path: str = field(
+        default=None, metadata={"help": "The directory of Prefix Tuning parameters. Default to None"}
+    )
+    decode_strategy: str = field(
+        default="sampling",
+        metadata={
+            "help": "the decoding strategy of generation, which should be one of ['sampling', 'greedy_search', 'beam_search']. Default to sampling"
+        },
+    )
+    use_flash_attention: bool = field(
+        default=False,
+        metadata={"help": "Whether to use flash attention"},
+    )
+
+    mode: str = field(
+        default="dynamic", metadata={"help": "the type of predictor, it should be one of [dynamic, static]"}
+    )
+    inference_model: bool = field(default=False, metadata={"help": "whether use InferenceModel to do generation"})
+    quant_type: str = field(
+        default="",
+        metadata={
+            "help": "Quantization type. Supported values: a8w8, a8w8c8, a8w8_fp8, a8w8c8_fp8, weight_only_int4, weight_only_int8"
+        },
+    )
+    avx_model: bool = field(
+        default=False, metadata={"help": "whether use AvxModel to do generation when using cpu inference"}
+    )
+    avx_type: str = field(
+        default=None,
+        metadata={
+            "help": "avx compute type. Supported values: fp16, bf16,fp16_int8\
+        fp16: first_token and next_token run in fp16\
+        fp16_int8 : first_token run in fp16, next token run in int8"
+        },
+    )
+    avx_cachekv_type: str = field(
+        default="fp16",
+        metadata={"help": "avx cachekv type. Supported values: fp16,int8"},
+    )
+    batch_size: int = field(default=1, metadata={"help": "The batch size of data."})
+    benchmark: bool = field(
+        default=False,
+        metadata={
+            "help": "If benchmark set as `True`, we will force model decode to max_length, which is helpful to compute throughput. "
+        },
+    )
+    use_fake_parameter: bool = field(default=False, metadata={"help": "use fake parameter, for ptq scales now."})
+    block_attn: bool = field(default=False, metadata={"help": "whether use block attention"})
+    block_size: int = field(default=64, metadata={"help": "the block size for cache_kvs."})
+    cachekv_int8_type: str = field(
+        default=None,
+        metadata={
+            "help": "If cachekv_int8_type set as `dynamic`, cache kv would be quantized to int8 dynamically. If cachekv_int8_type set as `static`, cache kv would be quantized to int8 Statically."
+        },
+    )
+
+    append_attn: bool = field(default=False, metadata={"help": "whether use append attention"})
+
+    chat_template: str = field(
+        default=None,
+        metadata={
+            "help": "the path of `chat_template.json` file to handle multi-rounds conversation. "
+            "If is None(do not set --chat_template argument), it will use the default `chat_template.json`;"
+            "If is equal with `model_name_or_path`, it will use the default loading; "
+            "If is directory, it will find the `chat_template.json` under the directory; If is file, it will load it."
+            "If is none string, it will not use chat_template.json."
+        },
+    )
+
+    total_max_length: int = field(
+        default=4096, metadata={"help": "Super parameter. Maximum sequence length(encoder+decoder)."}
+    )
+    speculate_method: str = field(
+        default=None,
+        metadata={
+            "help": "speculate method, it should be one of ['None', 'inference_with_reference', 'eagle', 'mtp']"
+        },
+    )
+    speculate_max_draft_token_num: int = field(
+        default=1,
+        metadata={"help": "the max length of draft tokens for speculate method."},
+    )
+    speculate_max_ngram_size: int = field(default=1, metadata={"help": "the max ngram size of speculate method."})
+    speculate_verify_window: int = field(
+        default=2, metadata={"help": "the max length of verify window for speculate method."}
+    )
+    speculate_max_candidate_len: int = field(default=5, metadata={"help": "the max length of candidate tokens."})
+    draft_model_name_or_path: str = field(default=None, metadata={"help": "The directory of eagle or draft model"})
+    draft_model_quant_type: str = field(
+        default="",
+        metadata={"help": "Draft model quantization type. Reserved for future"},
+    )
+    return_full_hidden_states: bool = field(default=False, metadata={"help": "whether return full hidden_states"})
+
+    mla_use_matrix_absorption: bool = field(default=False, metadata={"help": "implement mla with matrix-absorption."})
+    weightonly_group_size: int = field(default=-1, metadata={"help": "the max length of candidate tokens."})
+    weight_block_size: List[int] = field(
+        default_factory=lambda: [128, 128],
+        metadata={"help": "Quantitative granularity of weights. Supported values: [128 128]"},
+    )
+    moe_quant_type: str = field(
+        default="",
+        metadata={"help": "Quantization type of moe. Supported values: weight_only_int4, weight_only_int8"},
+    )
+
+    def __post_init__(self):
+        if self.speculate_method is not None:
+            self.append_attn = True
+        if self.append_attn:
+            self.block_attn = True
+        assert (
+            self.src_length + self.max_length <= self.total_max_length
+        ), "src_length + max_length should smaller than total_max_length."
 
 
-class InferenceEngine(object):
-    """
-    Model Parallel Inference Engine
+@dataclass
+class ModelArgument:
+    model_type: str = field(
+        default=None,
+        metadata={"help": "the type of the model, which can be one of ['gpt-3', 'ernie-3.5-se', 'llama-img2txt']"},
+    )
+    data_file: str = field(default=None, metadata={"help": "data file directory"})
+    output_file: str = field(default="output.json", metadata={"help": "predict result file directory"})
 
-    Args:
-        model_dir (string): root directory of inference model
-        mp_degree (int): model parallel size
-    """
+class DygraphBlockInferencePredictor(object):
+    def __init__(
+        self, model_dir, dtype, **kwargs
+    ):
+        paddle.set_device("intel_hpu:0")
+        paddle.set_default_dtype(dtype)
 
-    def __init__(self, model_dir, share_inputs, cache_kvs, config, mp_degree=1):
-        self.config = config
-        self.model_dir = model_dir
-        self.mp_degree = mp_degree
+        predictor_args = PredictorArgument()
+        predictor_args.model_name_or_path = model_dir
+        predictor_args.inference_model = True
+        predictor_args.dtype = dtype
+        model_args=ModelArgument()
 
-        self.share_inputs = share_inputs
-        self.cache_kvs = cache_kvs
+        # from paddlenlp.utils.env import USE_FAST_TOKENIZER
 
-        if mp_degree == 1:
-            self.nranks = 1
-            self.rank = 0
-        else:
-            self.nranks = fleet.worker_num()
-            self.rank = fleet.worker_index()
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_dir, padding_side="left", use_fast=False
+        )
 
-        self._init_predictor()
-        if not self.config.return_full_hidden_states:
-            self.share_data()
+        # init chat_template for tokenizer
+        llm_utils.init_chat_template(tokenizer, model_dir)
 
-    def _init_predictor(self):
-        """
-        predictor init
-        """
-        device_id = self.rank % self.config.mp_num_per_node
-        if use_pir_api():
-            self.model_file = os.path.join(self.model_dir, "model.json")
-            self.param_file = os.path.join(self.model_dir, "model.pdiparams")
-        else:
-            self.model_file = os.path.join(self.model_dir, "model.pdmodel")
-            self.param_file = os.path.join(self.model_dir, "model.pdiparams")
-        config = paddle.inference.Config(self.model_file, self.param_file)
+        # TODO(wj-Mcat): fix llama tokenzier pad_token bug
+        if (isinstance(tokenizer, (LlamaTokenizer, Llama3Tokenizer))) and not tokenizer.pad_token:
+            tokenizer.pad_token = tokenizer.eos_token
 
-        if paddle.is_compiled_with_xpu():
-            config.enable_xpu()
-            device_id = int(os.environ.get("FLAGS_selected_xpus", 0))
-            config.set_xpu_device_id(device_id)
-            xpu_config = paddle.inference.XpuConfig()
-            xpu_config.device_id = device_id
-            xpu_config.l3_size = 0
-            xpu_config.l3_autotune_size = 0
-            config.set_xpu_config(xpu_config)
-            config.switch_ir_optim(True)
-        else:
-            config.enable_use_gpu(100, device_id)
-        
-        if use_pir_api():
-            config.enable_new_executor()
-            config.enable_new_ir()
+        config = AutoConfig.from_pretrained(model_dir)
 
-        self.predictor = paddle.inference.create_predictor(config)
-        self.input_names = self.predictor.get_input_names()
-        self.seq_lens_handle = self.predictor.get_input_handle("seq_lens_this_time")
+        tensor_parallel_rank, tensor_parallel_degree = llm_utils.init_dist_env()
 
-    def share_data(self):
-        """
-        share data
-        """
-        for name in self.input_names:
-            if "caches" in name:
-                input_tensor = self.predictor.get_input_handle(name)
-                input_tensor.share_external_data(self.cache_kvs[name])
-                continue
-            if "seq_lens_this_time" in name:
-                continue
-            input_tensor = self.predictor.get_input_handle(name)
-            input_tensor.share_external_data(self.share_inputs[name])
+        predictor_args.decode_strategy = "greedy_search"
+        predictor_args.top_p = 0.0
+        predictor_args.temperature = 1.0
+
+        tensor_parallel_rank, tensor_parallel_degree = llm_utils.init_dist_env()
+
+        predictor_args.inference_model = True
+        predictor_args.append_attn = True
+        predictor_args.block_attn = True
+        self.model = AutoInferenceModelForCausalLM.from_pretrained(
+            predictor_args.model_name_or_path,
+            config=config,
+            predictor_args=predictor_args,
+            model_args=model_args,
+            dtype=dtype,
+            tensor_parallel_degree=tensor_parallel_degree,
+            tensor_parallel_rank=tensor_parallel_rank,
+        )
+
+    @paddle.no_grad()
+    def _infer(self, share_inputs: dict[str, paddle.Tensor]):
+        return self.model.generate(
+            **share_inputs,
+        )
 
 
 def parse_args():
@@ -796,14 +917,8 @@ def main():
     start model runner
     """
     args = parse_args()
-    llm_utils.set_triton_cache(args.model_dir, "static")
-    try:
-        from paddle.utils import try_import
-
-        try_import("paddlenlp_ops")
-    except ImportError:
-        logger.warning("paddlenlp_ops does not exist, please install paddlenlp_ops.")
-        return
+    args.model_dir = args.model_dir + "/meta-llama/Llama-2-7b-chat"
+    llm_utils.set_triton_cache(args.model_dir, "dynamic")
     model_runner = ModelRunner(args)
     model_runner.run()
 
