@@ -1444,7 +1444,6 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
                 block_offsets,
                 block_mapping,
                 attention_mask,
-                batch_ids,
                 valid_seq_len,
             ) = prepare_input_hpu(
                 input_ids,
@@ -1462,7 +1461,6 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
             kwargs["block_offsets"] = block_offsets
             kwargs["block_mapping"] = block_mapping
             kwargs["block_bias"] = attention_mask
-            kwargs["batch_ids"] = batch_ids
             kwargs["block_size"] = self.block_size
             kwargs["valid_seq_len"] = valid_seq_len
         else:
