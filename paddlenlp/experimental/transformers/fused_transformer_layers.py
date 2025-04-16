@@ -5600,7 +5600,6 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
         if len(src.shape) == 2:
             src = src.unsqueeze(axis=1)
 
-        rotary_embs = rotary_embs.to(src.dtype)
         import paddlenlp_ops
 
         for i in range(self.num_layers):
@@ -5643,9 +5642,6 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                 v_cache = caches[2 * i + 1]
                 k_cache.index_put_((block_indices, block_offsets), key_states)
                 v_cache.index_put_((block_indices, block_offsets), value_states)
-
-                block_mapping = block_mapping.to(query_states.dtype)
-                block_bias = block_bias.to(query_states.dtype)
 
                 out_linear_out = paddlenlp_ops.fused_flatpa_proj_ref(
                     query_states,

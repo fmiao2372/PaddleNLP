@@ -1453,6 +1453,7 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
                 seq_lens_this_time,
                 seq_lens_encoder,
                 seq_lens_decoder,
+                paddle.get_default_dtype(),
             )
             cum_offsets = None
             kwargs["block_groups"] = block_groups
