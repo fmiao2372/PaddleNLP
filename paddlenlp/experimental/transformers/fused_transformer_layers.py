@@ -5694,5 +5694,4 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
         kwargs["seq_lens"] = seq_lens
         kwargs["input_ids"] = input_ids
 
-        out = self.post_process(**kwargs)
-        return out, caches
+        return multi_block_output, caches
