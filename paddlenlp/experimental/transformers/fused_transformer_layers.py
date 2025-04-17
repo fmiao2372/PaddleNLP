@@ -5586,8 +5586,6 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
         seq_lens_decoder = kwargs.get("seq_lens_decoder", None)
         block_size = kwargs.get("block_size", None)
         block_indices = kwargs.get("block_indices", None)
-        valid_seq_len = kwargs.get("valid_seq_len", None)
-
         block_groups = kwargs.get("block_groups", None)
         block_list = kwargs.get("block_list", None)
         block_offsets = kwargs.get("block_offsets", None)
@@ -5678,16 +5676,10 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
             src = residual_input + ffn2_out
             # end LlamaDecoderLayer
 
-        if max_enc_len > 0:  # context
-            batch_indices = paddle.arange(valid_seq_len.shape[0], dtype="int32")
-            indices = valid_seq_len - 1
-            multi_block_output = src[batch_indices, indices]
-        elif max_dec_len > 0:
-            multi_block_output = src.squeeze(axis=1)
-
         kwargs["time_step"] = time_step
-        kwargs["multi_block_output"] = multi_block_output
+        kwargs["multi_block_output"] = src
         kwargs["seq_lens"] = seq_lens
         kwargs["input_ids"] = input_ids
 
-        return multi_block_output, caches
+        out = self.post_process(**kwargs)
+        return out, caches
