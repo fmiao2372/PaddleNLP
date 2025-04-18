@@ -1450,7 +1450,6 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
                 rope_emb,
                 block_tables,
                 self.block_size,
-                seq_lens_this_time,
                 seq_lens_encoder,
                 seq_lens_decoder,
                 paddle.get_default_dtype(),
