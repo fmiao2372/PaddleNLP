@@ -5592,24 +5592,30 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
         block_mapping = kwargs.get("block_mapping", None)
         block_bias = kwargs.get("block_bias", None)
 
-        max_enc_len = paddle.max(seq_lens_encoder, axis=0)
-        max_dec_len = paddle.max(seq_lens_decoder, axis=0)
+        max_enc_len = paddle.max(seq_lens_encoder, axis=0).item()
+        max_dec_len = paddle.max(seq_lens_decoder, axis=0).item()
 
         if len(src.shape) == 2:
             src = src.unsqueeze(axis=1)
 
         import paddlenlp_ops
 
-        for i in range(self.num_layers):
-            residual_input = src
-            query_states, key_value_states = paddlenlp_ops.fused_rms_qkv_rope_t(
-                src, self.ln_scales[i], self.qkv_weights[i], rotary_embs, self._epsilon, self.head_dim, self.num_heads
-            )
-            # Fused-OP-1 end
+        if max_enc_len > 0:  # context
+            for i in range(self.num_layers):
+                residual_input = src
+                query_states, key_value_states = paddlenlp_ops.fused_rms_qkv_rope_t(
+                    src,
+                    self.ln_scales[i],
+                    self.qkv_weights[i],
+                    rotary_embs,
+                    self._epsilon,
+                    self.head_dim,
+                    self.num_heads,
+                )
+                # Fused-OP-1 end
 
-            # Fused-OP-2 start
-            # write cache kv (inplace)
-            if max_enc_len > 0:  # context
+                # Fused-OP-2 start
+                # write cache kv (inplace)
                 #         [2, 8,   384, 32, 128]
                 #         [2, 8, 6, 64, 32, 128]
                 #         [2, 48,   64, 32, 128]
@@ -5632,7 +5638,45 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     scaling_factor=self.head_dim**-0.5,
                     causal=True,
                 )
-            elif max_dec_len > 0:
+                # Fused-OP-2 end
+
+                # all_reduce
+                if self.tp_degree > 1:
+                    dist.all_reduce(out_linear_out)
+                out_linear_out = residual_input + out_linear_out
+                residual_input = out_linear_out
+
+                # Fused-OP-4 start
+                ffn2_out = paddlenlp_ops.fused_rms_mlp(
+                    out_linear_out,
+                    self.ffn_ln_scales[i],
+                    self.ffn1_weights[i],
+                    self.ffn2_weights[i],
+                    self._epsilon,
+                )
+                # Fused-OP-4 end
+
+                # all_reduce
+                if self.tp_degree > 1:
+                    dist.all_reduce(ffn2_out)
+                src = residual_input + ffn2_out
+                # end LlamaDecoderLayer
+        elif max_dec_len > 0:
+            for i in range(self.num_layers):
+                residual_input = src
+                query_states, key_value_states = paddlenlp_ops.fused_rms_qkv_rope_t(
+                    src,
+                    self.ln_scales[i],
+                    self.qkv_weights[i],
+                    rotary_embs,
+                    self._epsilon,
+                    self.head_dim,
+                    self.num_heads,
+                )
+                # Fused-OP-1 end
+
+                # Fused-OP-2 start
+                # write cache kv (inplace)
                 # [2, B, 1, 32, 128] --> [64][max_block_num, blk_size, 32, 128]
                 key_states = key_value_states[0].squeeze(1)
                 value_states = key_value_states[1].squeeze(1)
@@ -5641,7 +5685,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                 k_cache.index_put_((block_indices, block_offsets), key_states)
                 v_cache.index_put_((block_indices, block_offsets), value_states)
 
-                out_linear_out = paddlenlp_ops.fused_flatpa_proj_ref(
+                out_linear_out = paddlenlp_ops.fused_flatpa_proj(
                     query_states,
                     caches[2 * i],
                     caches[2 * i + 1],
@@ -5652,29 +5696,29 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     self.linear_weights[i],
                     scaling_factor=self.head_dim**-0.5,
                 )
-            # Fused-OP-2 end
+                # Fused-OP-2 end
 
-            # all_reduce
-            if self.tp_degree > 1:
-                dist.all_reduce(out_linear_out)
-            out_linear_out = residual_input + out_linear_out
-            residual_input = out_linear_out
+                # all_reduce
+                if self.tp_degree > 1:
+                    dist.all_reduce(out_linear_out)
+                out_linear_out = residual_input + out_linear_out
+                residual_input = out_linear_out
 
-            # Fused-OP-4 start
-            ffn2_out = paddlenlp_ops.fused_rms_mlp(
-                out_linear_out,
-                self.ffn_ln_scales[i],
-                self.ffn1_weights[i],
-                self.ffn2_weights[i],
-                self._epsilon,
-            )
-            # Fused-OP-4 end
+                # Fused-OP-4 start
+                ffn2_out = paddlenlp_ops.fused_rms_mlp(
+                    out_linear_out,
+                    self.ffn_ln_scales[i],
+                    self.ffn1_weights[i],
+                    self.ffn2_weights[i],
+                    self._epsilon,
+                )
+                # Fused-OP-4 end
 
-            # all_reduce
-            if self.tp_degree > 1:
-                dist.all_reduce(ffn2_out)
-            src = residual_input + ffn2_out
-            # end LlamaDecoderLayer
+                # all_reduce
+                if self.tp_degree > 1:
+                    dist.all_reduce(ffn2_out)
+                src = residual_input + ffn2_out
+                # end LlamaDecoderLayer
 
         kwargs["time_step"] = time_step
         kwargs["multi_block_output"] = src
