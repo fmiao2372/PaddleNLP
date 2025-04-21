@@ -27,7 +27,7 @@ import paddle
 import paddle.distributed as dist
 import paddle.distributed.fleet as fleet
 from paddle.base.framework import use_pir_api
-# from paddlenlp_ops import step_paddle
+from paddlenlp_ops import step_paddle
 from server.data.processor import DataProcessor
 from server.engine.config import global_config
 from server.utils import get_logger
@@ -510,33 +510,32 @@ class ModelRunner:
         #         self.speculate_config.speculate_max_draft_token_num,
         #     )
         # else:
-        #     step_paddle(
-        #         self.share_inputs["stop_flags"],
-        #         self.share_inputs["seq_lens_this_time"],
-        #         self.share_inputs["step_seq_lens_encoder"],
-        #         self.share_inputs["seq_lens_encoder"],
-        #         self.share_inputs["seq_lens_decoder"],
-        #         self.share_inputs["block_tables"],
-        #         self.share_inputs["encoder_block_lens"],
-        #         self.share_inputs["is_block_step"],
-        #         self.share_inputs["step_block_list"],
-        #         self.share_inputs["step_lens"],
-        #         self.share_inputs["recover_block_list"],
-        #         self.share_inputs["recover_lens"],
-        #         self.share_inputs["need_block_list"],
-        #         self.share_inputs["need_block_len"],
-        #         self.share_inputs["used_list_len"],
-        #         self.share_inputs["free_list"],
-        #         self.share_inputs["free_list_len"],
-        #         self.share_inputs["input_ids"],
-        #         self.share_inputs["pre_ids"],
-        #         self.share_inputs["step_idx"],
-        #         self.share_inputs["next_tokens"],
-        #         self.share_inputs["first_token_ids"],
-        #         self.args.block_size,
-        #         self.args.enc_dec_block_num,
-        #     )
-        pass
+        step_paddle(
+            self.share_inputs["stop_flags"],
+            self.share_inputs["seq_lens_this_time"],
+            self.share_inputs["step_seq_lens_encoder"],
+            self.share_inputs["seq_lens_encoder"],
+            self.share_inputs["seq_lens_decoder"],
+            self.share_inputs["block_tables"],
+            self.share_inputs["encoder_block_lens"],
+            self.share_inputs["is_block_step"],
+            self.share_inputs["step_block_list"],
+            self.share_inputs["step_lens"],
+            self.share_inputs["recover_block_list"],
+            self.share_inputs["recover_lens"],
+            self.share_inputs["need_block_list"],
+            self.share_inputs["need_block_len"],
+            self.share_inputs["used_list_len"],
+            self.share_inputs["free_list"],
+            self.share_inputs["free_list_len"],
+            self.share_inputs["input_ids"],
+            self.share_inputs["pre_ids"],
+            self.share_inputs["step_idx"],
+            self.share_inputs["next_tokens"],
+            self.share_inputs["first_token_ids"],
+            self.args.block_size,
+            self.args.enc_dec_block_num,
+        )
 
     def initialize_engine_ready_check_flag(self):
         """
