@@ -239,8 +239,8 @@ class ModelRunner:
                 self.cache_kvs.append(paddle.full(
                     shape=[
                         self.args.max_block_num,
-                        kv_num_head,
                         self.args.block_size,
+                        kv_num_head,
                         self.args.hidden_size // self.args.num_attention_heads,
                     ],
                     fill_value=0,
@@ -249,8 +249,8 @@ class ModelRunner:
                 self.cache_kvs.append(paddle.full(
                     shape=[
                         self.args.max_block_num,
-                        kv_num_head,
                         self.args.block_size,
+                        kv_num_head,
                         self.args.hidden_size // self.args.num_attention_heads,
                     ],
                     fill_value=0,
@@ -839,7 +839,7 @@ class DygraphBlockInferencePredictor(object):
     def __init__(
         self, model_dir, dtype, **kwargs
     ):
-        paddle.set_device("intel_hpu:0")
+        paddle.set_device("intel_hpu")
         paddle.set_default_dtype(dtype)
 
         predictor_args = PredictorArgument()
