@@ -801,7 +801,10 @@ class BlockInferencePredictorMixin(BasePredictor):
         BasePredictor.__init__(self, config, tokenizer, model)
 
         self.num_layers = len(self.cache_k_shapes)
-        self.num_key_value_heads = self.cache_k_shapes[0][-3]
+        if paddle.is_compiled_with_custom_device("intel_hpu"):
+            self.num_key_value_heads = self.cache_k_shapes[0][-2]
+        else:
+            self.num_key_value_heads = self.cache_k_shapes[0][-3]
         self.head_dim = self.cache_k_shapes[0][-1]
         self.max_block_nums = self.cache_k_shapes[0][0]
         self.batch_size = config.batch_size
