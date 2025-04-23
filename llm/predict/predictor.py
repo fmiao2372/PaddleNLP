@@ -1159,6 +1159,13 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
         if self.tensor_parallel_rank == 0:
             done_event.wait()
         s_time = time.time()
+        ## comment out to turn on perf profiling
+        # import paddle.profiler as profiler
+        # prof = profiler.Profiler(
+        #     targets=[profiler.ProfilerTarget.CPU, profiler.ProfilerTarget.CUSTOM_DEVICE],
+        #     scheduler=(0, 5),
+        #     on_trace_ready = profiler.export_chrome_tracing('./profile'))
+        # prof.start()
         while self.model_inputs["not_need_stop"]:
             # whether speculative decoding
             if self.proposer is not None:
@@ -1172,13 +1179,16 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
                 self.full_hidden_states = self._infer(self.model_inputs)
             else:
                 self._infer(self.model_inputs)
+            i = i +1
+        #     prof.step()
+        # prof.stop()
         logger.info(f"running spend {time.time() - s_time}")
 
         if self.tensor_parallel_rank == 0:
             outputs = []
             output_tokens = []
             while len(outputs) < len(input_texts):
-                result = result_queue.get(timeout=1)
+                result = result_queue.get(timeout=10)
                 outputs.append(result[-1])
                 output_tokens.append(result[-2])
 
@@ -1595,9 +1605,8 @@ def benchmark(predictor, predictor_args, model_args):
     batch_benchmark_texts = batchfy_text(benchmark_texts, predictor_args.batch_size)
     print("***********Start Benchmark**********")
 
-    warmup_time = 5
-    test_time = 20
-
+    warmup_time = 1
+    test_time = 5
     print("***********Start Warmup**********")
     for _ in range(warmup_time):
         for bs, batch_source_text in enumerate(batch_benchmark_texts):
