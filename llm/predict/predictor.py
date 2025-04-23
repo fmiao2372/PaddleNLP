@@ -1179,7 +1179,6 @@ class DygraphBlockInferencePredictor(BlockInferencePredictorMixin):
                 self.full_hidden_states = self._infer(self.model_inputs)
             else:
                 self._infer(self.model_inputs)
-            i = i +1
         #     prof.step()
         # prof.stop()
         logger.info(f"running spend {time.time() - s_time}")
