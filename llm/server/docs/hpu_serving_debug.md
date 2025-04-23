@@ -15,11 +15,11 @@ Conatiner: /models
 ```
 To update to the latest code, you can use the paddle_pull.sh script.
 
-### Update infer.py
-set hpu device in /opt/source/PaddleNLP/llm/server/server/server/engine/infer.py
+### Update settings
+set hpu device in /usr/local/bin/start_server
 
-``` python
-paddle.set_device("intel_hpu:0")
+``` bash
+export FLAGS_selected_intel_hpus=0
 ```
 
 ### Start server
