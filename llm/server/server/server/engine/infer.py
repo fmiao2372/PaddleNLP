@@ -347,7 +347,7 @@ class ModelRunner:
         self.share_inputs["infer_seed"] = paddle.full(shape=[self.args.max_batch_size, 1], fill_value=0, dtype="int64")
 
         free_list = list(
-            range(self.args.max_block_num - 1, int(self.args.max_block_num * self.args.block_ratio) - 1, -1)
+            range(self.args.max_block_num - 1 - 1, int(self.args.max_block_num * self.args.block_ratio) - 1, -1)
         )
         self.free_list_len = len(free_list)
 
