@@ -20,6 +20,7 @@ ps aux | egrep -i "paddle|spawn_main|triton" | grep -v grep | awk '{print $2}' |
 export GC_KERNEL_PATH=/usr/lib/habanalabs/libtpc_kernels.so
 export GC_KERNEL_PATH=/usr/local/lib/python3.10/dist-packages/paddle_custom_device/intel_hpu/libcustom_tpc_perf_lib.so:$GC_KERNEL_PATH
 export FLAGS_selected_intel_hpus=0
+export HPU_WARMUP=1
 export GLOG_v=0
 export GLOG_logtostderr=1
 export PYTHONIOENCODING=utf8

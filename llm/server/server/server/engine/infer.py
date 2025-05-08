@@ -53,6 +53,30 @@ File_Path = os.path.realpath(sys.argv[0])
 Dir_Path = os.path.dirname(File_Path)
 logger = get_logger("infer_server", "infer.log")
 
+def timing_decorator(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        elapsed_time = (end_time - start_time) * 1000
+        
+        wrapper.total_time += elapsed_time
+        wrapper.call_count += 1
+        
+        average_time = wrapper.total_time / wrapper.call_count
+        logger.info(f"{func.__name__} average time: {average_time:.3f} ms")
+        
+        return result
+    wrapper.total_time = 0
+    wrapper.call_count = 0
+
+    def reset_timer():
+        wrapper.total_time = 0
+        wrapper.call_count = 0
+        logger.info(f"Timer for {func.__name__} has been reset.")
+
+    wrapper.reset_timer = reset_timer
+    return wrapper
 
 class ModelRunner:
     def __init__(self, args):
@@ -409,7 +433,7 @@ class ModelRunner:
     #     # seq_lens_this_time need to be replaced in insert step
     #     self.input_tensors.append("None")
 
-    def dy_input_preprocess(self, tasks):
+    def dy_input_preprocess(self, tasks, is_decode=False):
         """
         dynamic insertion
         """
@@ -427,11 +451,18 @@ class ModelRunner:
             self.share_inputs["penalty_score"][idx : idx + 1] = task.get("penalty_score", 1.0)
             self.share_inputs["frequency_score"][idx : idx + 1] = task.get("frequency_score", 0.0)
             self.share_inputs["presence_score"][idx : idx + 1] = task.get("presence_score", 0.0)
-            self.helper_tensors["seq_lens_this_time"][idx : idx + 1] = length
-            self.share_inputs["step_seq_lens_encoder"][idx : idx + 1] = length
-            self.share_inputs["seq_lens_encoder"][idx : idx + 1] = length
-            self.share_inputs["seq_lens_decoder"][idx : idx + 1] = 0
-            self.share_inputs["step_idx"][idx : idx + 1] = 0
+            if is_decode:
+                self.helper_tensors["seq_lens_this_time"][idx : idx + 1] = 1
+                self.share_inputs["step_seq_lens_encoder"][idx : idx + 1] = 1
+                self.share_inputs["seq_lens_encoder"][idx : idx + 1] = 0
+                self.share_inputs["seq_lens_decoder"][idx : idx + 1] = length
+                self.share_inputs["step_idx"][idx : idx + 1] = length
+            else:
+                self.helper_tensors["seq_lens_this_time"][idx : idx + 1] = length
+                self.share_inputs["step_seq_lens_encoder"][idx : idx + 1] = length
+                self.share_inputs["seq_lens_encoder"][idx : idx + 1] = length
+                self.share_inputs["seq_lens_decoder"][idx : idx + 1] = 0
+                self.share_inputs["step_idx"][idx : idx + 1] = 0
             self.share_inputs["min_length"][idx : idx + 1] = task.get("min_dec_len", 1)
             if "max_dec_len" in task:
                 max_dec_len = task["max_dec_len"]
@@ -475,41 +506,11 @@ class ModelRunner:
                 elif self.speculate_config.speculate_method in ["eagle", "mtp"]:
                     self.proposer.insert_query(idx=idx, task=task)
 
+    @timing_decorator
     def step_cuda(self):
         """
         step cuda
         """
-
-        # if self.is_speculate_decoding:
-        #     speculate_step_paddle(
-        #         self.share_inputs["stop_flags"],
-        #         self.share_inputs["seq_lens_this_time"],
-        #         self.share_inputs["step_seq_lens_encoder"],
-        #         self.share_inputs["seq_lens_encoder"],
-        #         self.share_inputs["seq_lens_decoder"],
-        #         self.share_inputs["block_tables"],
-        #         self.share_inputs["encoder_block_lens"],
-        #         self.share_inputs["is_block_step"],
-        #         self.share_inputs["step_block_list"],
-        #         self.share_inputs["step_lens"],
-        #         self.share_inputs["recover_block_list"],
-        #         self.share_inputs["recover_lens"],
-        #         self.share_inputs["need_block_list"],
-        #         self.share_inputs["need_block_len"],
-        #         self.share_inputs["used_list_len"],
-        #         self.share_inputs["free_list"],
-        #         self.share_inputs["free_list_len"],
-        #         self.share_inputs["input_ids"],
-        #         self.share_inputs["pre_ids"],
-        #         self.share_inputs["step_idx"],
-        #         self.share_inputs["next_tokens"],
-        #         self.share_inputs["first_token_ids"],
-        #         self.share_inputs["accept_num"],
-        #         self.args.block_size,
-        #         self.args.enc_dec_block_num,
-        #         self.speculate_config.speculate_max_draft_token_num,
-        #     )
-        # else:
         step_paddle(
             self.share_inputs["stop_flags"],
             self.share_inputs["seq_lens_this_time"],
@@ -694,6 +695,68 @@ class ModelRunner:
             self.share_inputs["infer_seed"][:] %= self.MAX_INFER_SEED
             if self.free_list_len > 0:
                 self.step_cuda()
+
+    def warmup(self):
+        """
+        run warmup
+        """
+        for prefill_batch in range(1, self.config.max_prefill_batch + 1):
+            for prefill_length in range(self.args.block_size, self.args.max_seq_len, self.args.block_size):
+                prefill_length = prefill_length + self.args.enc_dec_block_num * self.args.block_size
+                prefill_length = min(prefill_length, self.args.max_seq_len)
+                logger.info(f"warmup prefill_batch: {prefill_batch}, prefill_length: {prefill_length} start")
+                tasks = [
+                    {
+                        "idx": i,
+                        "input_ids": [1] + [100] * (prefill_length - 2),
+                        "block_tables": list(range(prefill_length // self.args.block_size)),
+                        "eos_token_ids": [2],
+                    }
+                    for i in range(prefill_batch)
+                ]
+                self.dy_input_preprocess(tasks)
+                self.share_inputs["seq_lens_this_time"] = copy.deepcopy(
+                    self.helper_tensors["seq_lens_this_time"][:len(tasks)]
+                )
+                self.share_inputs["not_need_stop"][0] = True
+                self.share_inputs["cache_kvs"] = self.cache_kvs
+                self.dygraph_block_inference_predictor._infer(self.share_inputs)
+                logger.info(f"warmup prefill_batch: {prefill_batch}, prefill_length: {prefill_length} done")
+        
+        pre_max_block_num = (
+                    self.args.max_seq_len + self.args.block_size - 1
+                ) // self.args.block_size + self.args.enc_dec_block_num
+        for decode_batch in range(1, self.args.max_batch_size + 1):
+            for decode_block_num in range(16, pre_max_block_num * self.args.max_batch_size, 16):
+                if decode_block_num // decode_batch * self.args.block_size > self.args.max_seq_len:
+                    continue
+                if decode_block_num > self.args.max_block_num:
+                    continue  
+                logger.info(f"warmup decode_batch: {decode_batch}, decode_block_num: {decode_block_num}")
+                blocks = [decode_block_num // decode_batch for _ in range(decode_batch)]
+                blocks[0] += decode_block_num % decode_batch
+                if blocks[0] * self.args.block_size > self.args.max_seq_len:
+                    continue
+                tasks = [
+                    {
+                        "idx": i,
+                        "input_ids": [1] + [100] * (blocks[i] * self.args.block_size - 2),
+                        "block_tables": list(range(blocks[i])),
+                        "eos_token_ids": [2],
+                    }
+                    for i in range(decode_batch)
+                ]
+                for task in tasks:
+                    logger.info(f"idx: {task['idx']}, input_ids_len: {len(task['input_ids'])}, block_tables_len: {len(task['block_tables'])}")
+                self.dy_input_preprocess(tasks, True)
+                self.share_inputs["seq_lens_this_time"] = copy.deepcopy(
+                    self.helper_tensors["seq_lens_this_time"][:len(tasks)]
+                )
+                self.share_inputs["not_need_stop"][0] = True
+                self.share_inputs["cache_kvs"] = self.cache_kvs
+                self.dygraph_block_inference_predictor._infer(self.share_inputs)
+        self.dygraph_block_inference_predictor._infer.reset_timer()
+        self.step_cuda.reset_timer()
 
 @dataclass
 class PredictorArgument:
@@ -884,6 +947,7 @@ class DygraphBlockInferencePredictor(object):
         )
 
     @paddle.no_grad()
+    @timing_decorator
     def _infer(self, share_inputs: dict[str, paddle.Tensor]):
         return self.model.generate(
             **share_inputs,
@@ -919,6 +983,13 @@ def main():
     args.model_dir = args.model_dir + "/meta-llama/Llama-2-7b-chat"
     llm_utils.set_triton_cache(args.model_dir, "dynamic")
     model_runner = ModelRunner(args)
+    if os.getenv("HPU_WARMUP", "0") == "1":
+        model_runner.warmup()
+        os.environ['HPU_WARMUP'] = '0'
+        model_runner.share_inputs = {}
+        model_runner.helper_tensors = {}
+        model_runner.cache_kvs = []
+        model_runner.init_inputs()
     model_runner.run()
 
 
