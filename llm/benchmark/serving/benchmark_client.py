@@ -64,8 +64,8 @@ def infer(
                 "text": prompt,
                 "max_dec_len": max_dec_len,
                 "min_dec_len": min_dec_len,
-                "topp": 0.95,
-                "temperature": 0.6,
+                "topp": 0.0,
+                "temperature": 1.0,
                 "stream": True,
                 "return_all_tokens": False
             }
@@ -102,7 +102,7 @@ def infer(
             token_num = 0
             for chunk in chunks:
                 chunk_dict = json.loads(chunk.decode("utf-8").strip())
-                if chunk_dict["is_end"]:
+                if "is_end" in chunk_dict.keys() and chunk_dict["is_end"]:
                     token_num += chunk_dict["tokens_all_num"]
         else:
             token_num = len(chunks)
@@ -186,6 +186,26 @@ def warmup(
     end_time = time.perf_counter()
     print(f"Warmup completed. Elapsed time: {round(end_time - start_time, 2)} seconds")
 
+def sample_requests_random(num_requests: int, input_len: int, min_dec_len: int, max_dec_len: int):
+
+    prompt = "hi" * input_len
+    generated_data = [[prompt, input_len, max_dec_len]]
+    generated_data = generated_data * num_requests
+    que = mp.Queue()
+
+    total_input_len = sum(entry[1] for entry in generated_data)
+    total_output_len = sum(entry[2] for entry in generated_data)
+    avg_input_len = total_input_len / len(generated_data)
+    avg_output_len = total_output_len / len(generated_data)
+
+    print(f"Number of test samples: {len(generated_data)}")
+    print(f"Average input length: {avg_input_len:.2f}")
+    print(f"Average output length: {avg_output_len:.2f}")
+
+    for data in generated_data:
+        que.put(data)
+    print(f"Total samples added to request queue: {len(generated_data)}")
+    return que
 
 def sample_requests_filtered_shared_gpt(dataset_path: str, num_requests: int):
     with open(dataset_path, "r") as infile:
@@ -295,6 +315,7 @@ def main(
     port: str = "8100",
     warmup_round: int = 1,
     dataset_name: str = "sharegpt",
+    input_len: int = 128,
     min_dec_len: int = 1,
     max_dec_len: int = 2048,
     output_file: Optional[str] = None,
@@ -315,6 +336,8 @@ def main(
         req_que = sample_requests_filtered_shared_gpt(dataset_path, num_prompts)
     elif dataset_name == "paddle_inner":
         req_que = sample_requests_inner(dataset_path, num_prompts)
+    elif dataset_name == "random":
+        req_que = sample_requests_random(num_prompts, input_len, min_dec_len, max_dec_len)
     else:
         raise ValueError("Invalid dataset name. Choose from: sharegpt, paddle_inner")
 
@@ -386,7 +409,8 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="localhost", help="Host address of the inference server.")
     parser.add_argument("--port", type=str, default="8100", help="Port of the inference server.")
     parser.add_argument("--warmup_round", type=int, default=1, help="Number of warmup rounds.")
-    parser.add_argument("--dataset_name", type=str, default="sharegpt", choices=["sharegpt", "paddle_inner"], help="Name of the dataset to use.")
+    parser.add_argument("--dataset_name", type=str, default="sharegpt", choices=["sharegpt", "paddle_inner", "random"], help="Name of the dataset to use.")
+    parser.add_argument("--input_len", type=int, default=128, help="Input length for random dataset.")
     parser.add_argument("--min_dec_len", type=int, default=1, help="Minimum decoding length.")
     parser.add_argument("--max_dec_len", type=int, default=2048, help="Maximum decoding length.")
     parser.add_argument("--output_file", type=str, default=None, help="Path to save the results file.")
@@ -402,6 +426,7 @@ if __name__ == "__main__":
         port=args.port,
         warmup_round=args.warmup_round,
         dataset_name=args.dataset_name,
+        input_len=args.input_len,
         min_dec_len=args.min_dec_len,
         max_dec_len=args.max_dec_len,
         output_file=args.output_file,
