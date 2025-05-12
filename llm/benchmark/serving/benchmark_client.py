@@ -10,7 +10,7 @@ import requests
 from sentencepiece import SentencePieceProcessor
 from typing import AsyncGenerator, List, Optional, Tuple, Union
 import argparse
-
+from queue import Empty
 
 def infer(
     session_id: int,
@@ -27,8 +27,8 @@ def infer(
     while not req_que.empty():
         try:
             prompt, input_seqlen, output_seqlen = req_que.get(timeout=10.0)
-        except:
-            continue
+        except Empty:
+            break
 
         start = time.time()
         is_first = True
