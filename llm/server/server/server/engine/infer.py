@@ -139,7 +139,8 @@ class ModelRunner:
 
         self.dygraph_block_inference_predictor = DygraphBlockInferencePredictor(
             model_dir=model_rank_path,
-            dtype=self.args.dtype)
+            dtype=self.args.dtype,
+            block_size=self.args.block_size)
 
         # if self.config.return_full_hidden_states:
         #     self.set_inputs()
@@ -899,7 +900,7 @@ class ModelArgument:
 
 class DygraphBlockInferencePredictor(object):
     def __init__(
-        self, model_dir, dtype, **kwargs
+        self, model_dir, dtype, block_size, **kwargs
     ):
         paddle.set_device("intel_hpu")
         paddle.set_default_dtype(dtype)
@@ -908,6 +909,7 @@ class DygraphBlockInferencePredictor(object):
         predictor_args.model_name_or_path = model_dir
         predictor_args.inference_model = True
         predictor_args.dtype = dtype
+        predictor_args.batch_size = block_size
         model_args=ModelArgument()
 
         # from paddlenlp.utils.env import USE_FAST_TOKENIZER

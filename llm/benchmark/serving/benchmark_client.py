@@ -115,8 +115,8 @@ def infer(
     print(f"Process ID {os.getpid()} has processed all requests.")
     if len(stats) > 0:
         res_que.put((session_id, stats))
-        end_flags.put(1)
-    print(f"Session {session_id} (PID={os.getpid()}) completed.")
+    end_flags.put(1)
+    print(f"Session {session_id} (PID={os.getpid()}) completed. end_flags size: {end_flags.qsize()}")
 
 
 def warmup(
