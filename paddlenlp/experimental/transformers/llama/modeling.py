@@ -1423,17 +1423,15 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
         return_dict=False,
         **kwargs,
     ):
-
         seq_lens_this_time = kwargs.get("seq_lens_this_time", None)
-        rope_emb = kwargs.get("rope_emb", None)
+        rotary_embs = kwargs.get("rope_emb", None)
 
         if paddle.is_compiled_with_custom_device("intel_hpu"):
-            from paddlenlp_ops import prepare_input_hpu
+            block_tables = kwargs.get("block_tables", None)
+            seq_lens_encoder = kwargs.get("seq_lens_encoder", None)
+            seq_lens_decoder = kwargs.get("seq_lens_decoder", None)
 
-            block_tables = kwargs.get("block_tables", None).to("CPU")
-            seq_lens_encoder = kwargs.get("seq_lens_encoder", None).to("CPU")
-            seq_lens_decoder = kwargs.get("seq_lens_decoder", None).to("CPU")
-            input_ids = input_ids.to("CPU")
+            from paddlenlp_ops import prepare_block_metadata
 
             (
                 ids_remove_padding,
@@ -1444,16 +1442,20 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
                 block_offsets,
                 block_mapping,
                 attention_mask,
-                valid_seq_len,
-            ) = prepare_input_hpu(
+                batch_ids,
+                is_prompt,
+            ) = prepare_block_metadata(
                 input_ids,
-                rope_emb,
+                rotary_embs,
                 block_tables,
-                self.block_size,
                 seq_lens_encoder,
                 seq_lens_decoder,
+                self.block_size,
                 paddle.get_default_dtype(),
             )
+            is_prompt = is_prompt.item() == 1 if is_prompt.item() > 0 else None
+            if is_prompt is True:
+                attention_mask = None
             cum_offsets = None
             kwargs["block_groups"] = block_groups
             kwargs["block_list"] = block_list
@@ -1462,7 +1464,9 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
             kwargs["block_mapping"] = block_mapping
             kwargs["block_bias"] = attention_mask
             kwargs["block_size"] = self.block_size
-            kwargs["valid_seq_len"] = valid_seq_len
+            kwargs["batch_ids"] = batch_ids
+            kwargs["is_prompt"] = is_prompt
+
         else:
             draft_tokens = kwargs.get("draft_tokens", None)
             seq_lens_encoder = kwargs.get("seq_lens_encoder", None)
