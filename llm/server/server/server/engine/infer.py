@@ -73,7 +73,7 @@ def timing_decorator(func):
     def reset_timer():
         wrapper.total_time = 0
         wrapper.call_count = 0
-        logger.info(f"Timer for {func.__name__} has been reset.")
+        # logger.info(f"Timer for {func.__name__} has been reset.")
 
     wrapper.reset_timer = reset_timer
     return wrapper
@@ -673,6 +673,8 @@ class ModelRunner:
                 if self.nranks > 1:
                     paddle.distributed.barrier()
 
+                self.dygraph_block_inference_predictor._infer.reset_timer()
+                self.step_cuda.reset_timer()
                 time.sleep(0.001)
                 continue
 
