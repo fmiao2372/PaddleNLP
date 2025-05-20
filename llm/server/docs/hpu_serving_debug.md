@@ -24,7 +24,7 @@ export FLAGS_selected_intel_hpus=0
 
 ### Start server
 ``` bash
-cd /opt
+cd /opt/output
 start_server
 ```
 You can edit the start_server script and update the related settings accordingly.

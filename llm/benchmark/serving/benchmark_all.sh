@@ -7,6 +7,7 @@ batch_sizes=(1 2 4 8 16 32 64 128)
 for input_length in "${input_lengths[@]}"; do
   for output_length in "${output_lengths[@]}"; do
     for batch_size in "${batch_sizes[@]}"; do
+      sleep 3
       num_prompts=$(( batch_size * 3))
       log_name="benchmarkdata_Llama-2-7b-chat-hf_inputlength_${input_length}_outputlength_${output_length}_batchsize_${batch_size}_numprompts_${num_prompts}.log"
       rm -f ${log_name}
