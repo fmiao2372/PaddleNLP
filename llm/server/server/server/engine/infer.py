@@ -27,7 +27,7 @@ import paddle
 import paddle.distributed as dist
 import paddle.distributed.fleet as fleet
 from paddle.base.framework import use_pir_api
-from paddlenlp_ops import step_paddle
+from paddlenlp_ops import step_paddle, recover_block
 from server.data.processor import DataProcessor
 from server.engine.config import global_config
 from server.utils import get_logger
@@ -287,7 +287,7 @@ class ModelRunner:
         ) // self.args.block_size + self.args.enc_dec_block_num
         self.share_inputs["block_tables"] = paddle.full(
             shape=[self.args.max_batch_size, pre_max_block_num], fill_value=-1, dtype="int32"
-        )
+        ).cpu()
 
         self.share_inputs["pre_ids"] = paddle.to_tensor(
             np.full((self.args.max_batch_size, self.args.max_dec_len), -1, dtype="int64")
@@ -352,23 +352,23 @@ class ModelRunner:
         )
         self.share_inputs["is_block_step"] = paddle.full(
             shape=[self.args.max_batch_size], fill_value=False, dtype="bool"
-        )
+        ).cpu()
         self.share_inputs["encoder_block_lens"] = paddle.full(
             shape=[self.args.max_batch_size], fill_value=0, dtype="int32"
-        )
+        ).cpu()
         self.share_inputs["step_block_list"] = paddle.full(
             shape=[self.args.max_batch_size], fill_value=-1, dtype="int32"
-        )
-        self.share_inputs["step_lens"] = paddle.full(shape=[1], fill_value=0, dtype="int32")
+        ).cpu()
+        self.share_inputs["step_lens"] = paddle.full(shape=[1], fill_value=0, dtype="int32").cpu()
         self.share_inputs["recover_block_list"] = paddle.full(
             shape=[self.args.max_batch_size], fill_value=-1, dtype="int32"
-        )
-        self.share_inputs["recover_lens"] = paddle.full(shape=[1], fill_value=0, dtype="int32")
+        ).cpu()
+        self.share_inputs["recover_lens"] = paddle.full(shape=[1], fill_value=0, dtype="int32").cpu()
         self.share_inputs["need_block_list"] = paddle.full(
             shape=[self.args.max_batch_size], fill_value=-1, dtype="int32"
-        )
-        self.share_inputs["need_block_len"] = paddle.full(shape=[1], fill_value=0, dtype="int32")
-        self.share_inputs["used_list_len"] = paddle.full(shape=[self.args.max_batch_size], fill_value=0, dtype="int32")
+        ).cpu()
+        self.share_inputs["need_block_len"] = paddle.full(shape=[1], fill_value=0, dtype="int32").cpu()
+        self.share_inputs["used_list_len"] = paddle.full(shape=[self.args.max_batch_size], fill_value=0, dtype="int32").cpu()
         self.share_inputs["infer_seed"] = paddle.full(shape=[self.args.max_batch_size, 1], fill_value=0, dtype="int64")
 
         free_list = list(
@@ -376,8 +376,8 @@ class ModelRunner:
         )
         self.free_list_len = len(free_list)
 
-        self.share_inputs["free_list"] = paddle.to_tensor(free_list, dtype="int32")
-        self.share_inputs["free_list_len"] = paddle.full(shape=[1], fill_value=self.free_list_len, dtype="int32")
+        self.share_inputs["free_list"] = paddle.to_tensor(free_list, dtype="int32").cpu()
+        self.share_inputs["free_list_len"] = paddle.full(shape=[1], fill_value=self.free_list_len, dtype="int32").cpu()
 
         self.share_inputs["stop_seqs_len"] = paddle.full(
             shape=[
@@ -394,7 +394,7 @@ class ModelRunner:
         )
         self.share_inputs["ori_seq_lens_encoder"] = paddle.full(
             shape=[self.args.max_batch_size, 1], fill_value=0, dtype="int32"
-        )
+        ).cpu()
         # speculate decoding input
         if self.is_speculate_decoding:
             self.share_inputs["accept_tokens"] = paddle.full(
@@ -454,13 +454,13 @@ class ModelRunner:
             self.share_inputs["presence_score"][idx : idx + 1] = task.get("presence_score", 0.0)
             if is_decode:
                 self.helper_tensors["seq_lens_this_time"][idx : idx + 1] = 1
-                self.share_inputs["step_seq_lens_encoder"][idx : idx + 1] = 1
+                self.share_inputs["ori_seq_lens_encoder"][idx : idx + 1] = 1
                 self.share_inputs["seq_lens_encoder"][idx : idx + 1] = 0
                 self.share_inputs["seq_lens_decoder"][idx : idx + 1] = length
                 self.share_inputs["step_idx"][idx : idx + 1] = length
             else:
                 self.helper_tensors["seq_lens_this_time"][idx : idx + 1] = length
-                self.share_inputs["step_seq_lens_encoder"][idx : idx + 1] = length
+                self.share_inputs["ori_seq_lens_encoder"][idx : idx + 1] = length
                 self.share_inputs["seq_lens_encoder"][idx : idx + 1] = length
                 self.share_inputs["seq_lens_decoder"][idx : idx + 1] = 0
                 self.share_inputs["step_idx"][idx : idx + 1] = 0
@@ -475,7 +475,6 @@ class ModelRunner:
             self.share_inputs["stop_flags"][idx : idx + 1] = False
 
             self.share_inputs["first_token_ids"][idx : idx + 1] = self.share_inputs["input_ids"][idx : idx + 1, :1]
-            self.share_inputs["ori_seq_lens_encoder"][idx : idx + 1] = length
 
             if "infer_seed" in task:
                 self.share_inputs["infer_seed"][idx : idx + 1] = task["infer_seed"]
@@ -507,6 +506,51 @@ class ModelRunner:
                 elif self.speculate_config.speculate_method in ["eagle", "mtp"]:
                     self.proposer.insert_query(idx=idx, task=task)
 
+    def recover_block(self,
+                  recover_block_list,   #cpu
+                  recover_len,          #cpu
+                  stop_flags,           #hpu
+                  seq_lens_this_time,   #hpu
+                  ori_seq_lens_encoder, #cpu
+                  seq_lens_encoder,     #hpu
+                  block_tables,         #cpu
+                  free_list,            #cpu
+                  free_list_len,        #cpu
+                  input_ids,            #hpu
+                  pre_ids,              #hpu
+                  step_idx,             #hpu
+                  encoder_block_lens,   #cpu
+                  used_list_len,        #cpu
+                  next_tokens,          #hpu
+                  first_token_ids):     #hpu
+    
+        for bid in range(recover_len.item()):
+            recover_id = recover_block_list[bid].item()
+            ori_seq_len_encoder = ori_seq_lens_encoder[recover_id].item()
+            step_idx_now = step_idx[recover_id].item()
+            seq_len = ori_seq_len_encoder + step_idx_now
+            encoder_block_len = encoder_block_lens[recover_id].item()
+            decoder_used_len = used_list_len[recover_id].item()
+
+            seq_lens_this_time[recover_id] = seq_len
+            seq_lens_encoder[recover_id] = seq_len
+            stop_flags[recover_id] = False
+
+            ori_free_list_len = free_list_len[0]
+            free_list_len[0] -= decoder_used_len
+
+            for i in range(decoder_used_len):
+                block_tables[recover_id, encoder_block_len + i] = free_list[ori_free_list_len - i - 1]
+
+            recover_block(input_ids, first_token_ids, pre_ids, next_tokens, recover_id, ori_seq_len_encoder, step_idx_now)
+            # input_ids[recover_id, 0].set_value(paddle.to_tensor(first_token_ids[recover_id].item()))
+            # input_ids[recover_id, ori_seq_len_encoder + step_idx_now - 1].set_value(paddle.to_tensor(next_tokens[recover_id].item()))
+            # for i in range(step_idx_now - 1):
+            #     input_ids[recover_id, ori_seq_len_encoder + i].set_value(paddle.to_tensor(pre_ids[recover_id, i + 1].item()))
+
+        if recover_len.item() > 0:
+            recover_len[0] = 0
+
     @timing_decorator
     def step_cuda(self):
         """
@@ -515,7 +559,6 @@ class ModelRunner:
         step_paddle(
             self.share_inputs["stop_flags"],
             self.share_inputs["seq_lens_this_time"],
-            self.share_inputs["step_seq_lens_encoder"],
             self.share_inputs["seq_lens_encoder"],
             self.share_inputs["seq_lens_decoder"],
             self.share_inputs["block_tables"],
@@ -530,14 +573,29 @@ class ModelRunner:
             self.share_inputs["used_list_len"],
             self.share_inputs["free_list"],
             self.share_inputs["free_list_len"],
-            self.share_inputs["input_ids"],
-            self.share_inputs["pre_ids"],
-            self.share_inputs["step_idx"],
-            self.share_inputs["next_tokens"],
             self.share_inputs["first_token_ids"],
             self.args.block_size,
-            self.args.enc_dec_block_num,
+            self.args.max_seq_len
         )
+        if (self.share_inputs["recover_lens"].item() > 0):
+            self.recover_block(
+                self.share_inputs["recover_block_list"],
+                self.share_inputs["recover_lens"],
+                self.share_inputs["stop_flags"],
+                self.share_inputs["seq_lens_this_time"],
+                self.share_inputs["ori_seq_lens_encoder"],
+                self.share_inputs["seq_lens_encoder"],
+                self.share_inputs["block_tables"],
+                self.share_inputs["free_list"],
+                self.share_inputs["free_list_len"],
+                self.share_inputs["input_ids"],
+                self.share_inputs["pre_ids"],
+                self.share_inputs["step_idx"],
+                self.share_inputs["encoder_block_lens"],
+                self.share_inputs["used_list_len"],
+                self.share_inputs["next_tokens"],
+                self.share_inputs["first_token_ids"]
+            )
 
     def initialize_engine_ready_check_flag(self):
         """
