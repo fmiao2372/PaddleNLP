@@ -969,7 +969,7 @@ class DygraphBlockInferencePredictor(object):
         predictor_args.model_name_or_path = model_dir
         predictor_args.inference_model = True
         predictor_args.dtype = dtype
-        predictor_args.batch_size = block_size
+        predictor_args.block_size = block_size
         model_args=ModelArgument()
 
         # from paddlenlp.utils.env import USE_FAST_TOKENIZER
