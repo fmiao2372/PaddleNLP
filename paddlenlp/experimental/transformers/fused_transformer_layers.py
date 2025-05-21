@@ -1144,6 +1144,8 @@ class FusedMultiTransformerBase(Layer):
     def compute_max_len(self, seq_lens_encoder, seq_lens_decoder, cum_offsets):
         if seq_lens_encoder is None or seq_lens_decoder is None or cum_offsets is None:
             return None, None
+        # yanfei: TODO blha_get_max_len
+        return paddle.max(seq_lens_encoder), paddle.max(seq_lens_decoder)
         return paddle.incubate.nn.functional.blha_get_max_len(
             seq_lens_encoder, seq_lens_decoder, cum_offsets  # cum_offsets.shape[0] used as bsz
         )
@@ -6794,8 +6796,6 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
 
         assert self.num_layers == len(self.qkv_weights)
 
-        seq_lens_encoder = kwargs.get("seq_lens_encoder", None)
-        seq_lens_decoder = kwargs.get("seq_lens_decoder", None)
         block_size = kwargs.get("block_size", None)
         block_indices = kwargs.get("block_indices", None)
         block_groups = kwargs.get("block_groups", None)
@@ -6803,16 +6803,14 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
         block_offsets = kwargs.get("block_offsets", None)
         block_mapping = kwargs.get("block_mapping", None)
         block_bias = kwargs.get("block_bias", None)
-
-        max_enc_len = paddle.max(seq_lens_encoder, axis=0).item()
-        max_dec_len = paddle.max(seq_lens_decoder, axis=0).item()
+        is_prompt = kwargs.get("is_prompt", None)
 
         if len(src.shape) == 2:
             src = src.unsqueeze(axis=1)
 
         import paddlenlp_ops
 
-        if max_enc_len > 0:  # context
+        if is_prompt is True:  # context
             for i in range(self.num_layers):
                 residual_input = src
                 query_states, key_value_states = paddlenlp_ops.fused_rms_qkv_rope_t(
@@ -6873,7 +6871,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     dist.all_reduce(ffn2_out)
                 src = residual_input + ffn2_out
                 # end LlamaDecoderLayer
-        elif max_dec_len > 0:
+        elif is_prompt is False:
             for i in range(self.num_layers):
                 residual_input = src
                 query_states, key_value_states = paddlenlp_ops.fused_rms_qkv_rope_t(
@@ -6934,8 +6932,23 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
 
         kwargs["time_step"] = time_step
         kwargs["multi_block_output"] = src
-        kwargs["seq_lens"] = seq_lens
         kwargs["input_ids"] = input_ids
 
         out = self.post_process(**kwargs)
         return out, caches
+
+    def post_process(self, **kwargs):
+        multi_block_output = kwargs.get("multi_block_output", None)
+        batch_ids = kwargs.get("batch_ids", None)
+        seq_lens_encoder = kwargs.get("seq_lens_encoder", None)
+        is_prompt = kwargs.get("is_prompt", None)
+
+        from paddlenlp_ops import rebuild_padding_v2
+
+        out = rebuild_padding_v2(
+            multi_block_output,
+            batch_ids,
+            seq_lens_encoder,
+            is_prompt,
+        )
+        return out

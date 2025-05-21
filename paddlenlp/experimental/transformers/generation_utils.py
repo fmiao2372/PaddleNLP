@@ -764,13 +764,14 @@ class GenerationBlockInferenceModel(GenerationMixin):
                     model_kwargs["all_token_ids"], next_tokens, model_kwargs["result_id"], model_kwargs["step_idx"]
                 )
             elif self.config.output_via_mq:
-                from paddlenlp_ops import save_output
+                if os.getenv("HPU_WARMUP", "0") == "0":
+                    from paddlenlp_ops import save_output
 
-                save_output(
-                    next_tokens,
-                    model_kwargs["not_need_stop"],
-                    self.config.tensor_parallel_rank,
-                )
+                    save_output(
+                        next_tokens,
+                        model_kwargs["not_need_stop"],
+                        self.config.tensor_parallel_rank,
+                    )
             return next_tokens
 
         # encoder
