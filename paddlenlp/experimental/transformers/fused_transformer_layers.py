@@ -6811,13 +6811,15 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
         import paddlenlp_ops
 
         if is_prompt is True:  # context
+            residual_input = src
+            ffn2_out = paddle.zeros_like(src, src.dtype)
             for i in range(self.num_layers):
-                residual_input = src
                 query_states, key_value_states = paddlenlp_ops.fused_rms_qkv_rope_t(
-                    src,
+                    ffn2_out,
                     self.ln_scales[i],
                     self.qkv_weights[i],
                     rotary_embs,
+                    residual_input,
                     self._epsilon,
                     self.head_dim,
                     self.num_heads,
@@ -6869,57 +6871,43 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                 # all_reduce
                 if self.tp_degree > 1:
                     dist.all_reduce(ffn2_out)
-                src = residual_input + ffn2_out
                 # end LlamaDecoderLayer
         elif is_prompt is False:
+            residual_input = src
+            ffn2_out = paddle.zeros_like(src, src.dtype)
             for i in range(self.num_layers):
-                residual_input = src
-                query_states, key_value_states = paddlenlp_ops.fused_rms_qkv_rope_t(
-                    src,
-                    self.ln_scales[i],
-                    self.qkv_weights[i],
+                out_linear_out = paddlenlp_ops.fused_block_attention(
+                    ffn2_out,
+                    residual_input,
                     rotary_embs,
-                    self._epsilon,
-                    self.head_dim,
-                    self.num_heads,
-                )
-                # Fused-OP-1 end
-
-                # Fused-OP-2 start
-                # write cache kv (inplace)
-                # [2, B, 1, 32, 128] --> [64][max_block_num, blk_size, 32, 128]
-                key_states = key_value_states[0].squeeze(1)
-                value_states = key_value_states[1].squeeze(1)
-                k_cache = caches[2 * i]
-                v_cache = caches[2 * i + 1]
-                k_cache.index_put_((block_indices, block_offsets), key_states)
-                v_cache.index_put_((block_indices, block_offsets), value_states)
-
-                out_linear_out = paddlenlp_ops.fused_flatpa_proj(
-                    query_states,
                     caches[2 * i],
                     caches[2 * i + 1],
                     block_groups,
                     block_list,
                     block_mapping,
                     block_bias,
+                    block_indices,
+                    block_offsets,
+                    self.ln_scales[i],
+                    self.qkv_weights[i],
                     self.linear_weights[i],
+                    self._epsilon,
+                    self.head_dim,
+                    self.num_heads,
                     scaling_factor=self.head_dim**-0.5,
                 )
-                # Fused-OP-2 end
 
                 # all_reduce
                 if self.tp_degree > 1:
                     dist.all_reduce(out_linear_out)
-                out_linear_out = residual_input + out_linear_out
-                residual_input = out_linear_out
 
                 # Fused-OP-4 start
-                ffn2_out = paddlenlp_ops.fused_rms_mlp(
+                ffn2_out = paddlenlp_ops.fused_rms_mlp_res(
                     out_linear_out,
                     self.ffn_ln_scales[i],
                     self.ffn1_weights[i],
                     self.ffn2_weights[i],
+                    residual_input,
                     self._epsilon,
                 )
                 # Fused-OP-4 end
@@ -6927,11 +6915,10 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                 # all_reduce
                 if self.tp_degree > 1:
                     dist.all_reduce(ffn2_out)
-                src = residual_input + ffn2_out
                 # end LlamaDecoderLayer
 
         kwargs["time_step"] = time_step
-        kwargs["multi_block_output"] = src
+        kwargs["multi_block_output"] = residual_input + ffn2_out
         kwargs["input_ids"] = input_ids
 
         out = self.post_process(**kwargs)
