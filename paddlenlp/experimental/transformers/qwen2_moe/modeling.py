@@ -23,6 +23,7 @@ from paddle.nn.quant import weight_quantize
 
 from paddlenlp.experimental.transformers.fused_transformer_layers import (
     FusedBlockMultiTransformer,
+    FusedBlockMultiTransformerHPU,
     FusedBlockMultiTransformerWeightOnly,
     FusedMultiTransformerBase,
     FusedMultiTransformerConfig,
@@ -777,6 +778,8 @@ class Qwen2MoeBlockInferenceModel(Qwen2MoeInferenceModel):
     def set_transformer_block(self, transformer_config):
         if self.use_weight_only:
             self.transformer_block = FusedBlockMultiTransformerWeightOnly(transformer_config)
+        elif paddle.is_compiled_with_custom_device("intel_hpu"):
+            self.transformer_block = FusedBlockMultiTransformerHPU(transformer_config)
         else:
             self.transformer_block = FusedBlockMultiTransformer(transformer_config)
 
@@ -805,22 +808,64 @@ class Qwen2MoeBlockInferenceModel(Qwen2MoeInferenceModel):
 
         seq_lens_this_time = kwargs.get("seq_lens_this_time", None)
         rope_emb = kwargs.get("rope_emb", None)
-        draft_tokens = kwargs.get("draft_tokens", None)
-        seq_lens_encoder = kwargs.get("seq_lens_encoder", None)
 
-        # whether speculative decoding or not
-        if draft_tokens is None:
-            ids_remove_padding, padding_offset, cum_offsets, cu_seqlens_q, cu_seqlens_k = self.remove_padding(
-                input_ids, seq_lens_this_time
+        if paddle.is_compiled_with_custom_device("intel_hpu"):
+            block_tables = kwargs.get("block_tables", None)
+            seq_lens_encoder = kwargs.get("seq_lens_encoder", None)
+            seq_lens_decoder = kwargs.get("seq_lens_decoder", None)
+
+            from paddlenlp_ops import prepare_block_metadata
+
+            (
+                ids_remove_padding,
+                rope_emb,
+                block_groups,
+                block_list,
+                block_indices,
+                block_offsets,
+                block_mapping,
+                attention_mask,
+                batch_ids,
+                is_prompt,
+            ) = prepare_block_metadata(
+                input_ids,
+                rope_emb,
+                block_tables,
+                seq_lens_encoder,
+                seq_lens_decoder,
+                self.block_size,
+                paddle.get_default_dtype(),
             )
+            is_prompt = is_prompt.item() == 1 if is_prompt.item() > 0 else None
+            if is_prompt is True:
+                attention_mask = None
+            cum_offsets = None
+            kwargs["block_groups"] = block_groups
+            kwargs["block_list"] = block_list
+            kwargs["block_indices"] = block_indices
+            kwargs["block_offsets"] = block_offsets
+            kwargs["block_mapping"] = block_mapping
+            kwargs["block_bias"] = attention_mask
+            kwargs["block_size"] = self.block_size
+            kwargs["batch_ids"] = batch_ids
+            kwargs["is_prompt"] = is_prompt
         else:
-            ids_remove_padding, padding_offset, cum_offsets, cu_seqlens_q, cu_seqlens_k = self.remove_padding(
-                input_ids, seq_lens_this_time, draft_tokens, seq_lens_encoder
-            )
-        kwargs["cu_seqlens_q"] = cu_seqlens_q
-        kwargs["cu_seqlens_k"] = cu_seqlens_k
-        kwargs["padding_offsets"] = padding_offset
-        kwargs["max_input_length"] = self.max_seq_len
+            draft_tokens = kwargs.get("draft_tokens", None)
+            seq_lens_encoder = kwargs.get("seq_lens_encoder", None)
+
+            # whether speculative decoding or not
+            if draft_tokens is None:
+                ids_remove_padding, padding_offset, cum_offsets, cu_seqlens_q, cu_seqlens_k = self.remove_padding(
+                    input_ids, seq_lens_this_time
+                )
+            else:
+                ids_remove_padding, padding_offset, cum_offsets, cu_seqlens_q, cu_seqlens_k = self.remove_padding(
+                    input_ids, seq_lens_this_time, draft_tokens, seq_lens_encoder
+                )
+            kwargs["cu_seqlens_q"] = cu_seqlens_q
+            kwargs["cu_seqlens_k"] = cu_seqlens_k
+            kwargs["padding_offsets"] = padding_offset
+            kwargs["max_input_length"] = self.max_seq_len
 
         inputs_embeds = self.embed_tokens(ids_remove_padding)
 
@@ -956,15 +1001,20 @@ class Qwen2MoeForCausalLMBlockInferenceModel(GenerationBlockInferenceModel, Qwen
         else:
             max_block_nums = max_batch_size * max_block_per_seq
 
+        cache_kv_shape = [
+            max_block_nums,
+            config.num_key_value_heads // max(config.tensor_parallel_degree, 1),
+            config.block_size,
+            config.hidden_size // config.num_attention_heads,
+        ]
+        if paddle.is_compiled_with_custom_device("intel_hpu"):
+            # HPU block multi-transformer
+            # Use KV Cache shape [max_block_nums, seq_len, num_head, head_dim]
+            cache_kv_shape = [cache_kv_shape[i] for i in [0, 2, 1, 3]]
+
         cache_k_shapes = []
         cache_v_shapes = []
         for _ in range(config.num_hidden_layers):
-            cache_kv_shape = [
-                max_block_nums,
-                config.num_key_value_heads // max(config.tensor_parallel_degree, 1),
-                config.block_size,
-                config.hidden_size // config.num_attention_heads,
-            ]
             cache_k_shapes.append(cache_kv_shape)
             cache_v_shapes.append(cache_kv_shape)
         return cache_k_shapes, cache_v_shapes

@@ -1435,7 +1435,7 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
         **kwargs,
     ):
         seq_lens_this_time = kwargs.get("seq_lens_this_time", None)
-        rotary_embs = kwargs.get("rope_emb", None)
+        rope_emb = kwargs.get("rope_emb", None)
 
         if paddle.is_compiled_with_custom_device("intel_hpu"):
             block_tables = kwargs.get("block_tables", None)
@@ -1457,7 +1457,7 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
                 is_prompt,
             ) = prepare_block_metadata(
                 input_ids,
-                rotary_embs,
+                rope_emb,
                 block_tables,
                 seq_lens_encoder,
                 seq_lens_decoder,
