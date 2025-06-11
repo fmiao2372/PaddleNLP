@@ -6775,6 +6775,52 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
 
         self.config = config
 
+    def baseline_moe(self, hidden_states, i):
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.reshape([-1, hidden_dim])
+
+        # !!! gate_weights 在 set_state_dict 时被 cast 成了 float32
+        logits = paddle.matmul(hidden_states, self.gate_weights[i].cast("bfloat16"))
+        weights = paddle.nn.functional.softmax(logits, axis=-1)
+        routing_weights, selected_experts = paddle.topk(weights, self.config.moe_config.top_k, axis=-1)
+        final_hidden_states = paddle.zeros_like(hidden_states)
+
+        expert_mask = paddle.transpose(
+            paddle.nn.functional.one_hot(selected_experts, num_classes=self.config.moe_config.num_experts), [2, 1, 0]
+        )
+
+        import paddlenlp_ops
+
+        for expert_id in range(self.config.moe_config.num_experts):
+            idx, top_x = paddle.where(expert_mask[expert_id])
+            if idx.size == 0:
+                continue
+            current_state = hidden_states[top_x]
+            current_state = paddlenlp_ops.fused_mlp(
+                current_state, self.ffn1_weights[i][expert_id], None, self.ffn2_weights[i][expert_id]
+            )
+
+            current_state = current_state.reshape([-1, hidden_dim])
+            current_hidden_states = current_state * routing_weights[top_x, idx]
+
+            for idx, pos in enumerate(top_x):
+                final_hidden_states[pos.item()] += current_hidden_states[idx]
+
+        final_hidden_states = paddle.reshape(final_hidden_states, [batch_size, seq_len, hidden_dim])
+        return final_hidden_states
+
+    def compute_shared_expert(self, tmp_out, i):
+        import paddlenlp_ops
+
+        ffn2_out = paddlenlp_ops.fused_mlp(
+            tmp_out, self.shared_expert_ffn1_weights[i], None, self.shared_expert_ffn2_weights[i]
+        )
+        if self.config.moe_config.shared_expert_with_gate:
+            gate_out = paddle.matmul(tmp_out, self.shared_expert_gate_weights[i])
+            gate_out = paddle.nn.functional.sigmoid(gate_out)
+            return gate_out * ffn2_out
+        return ffn2_out
+
     def forward(
         self,
         input_ids,
@@ -6810,8 +6856,8 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
 
         import paddlenlp_ops
 
+        residual_input = src
         if is_prompt is True:  # context
-            residual_input = src
             ffn2_out = paddle.zeros_like(src, src.dtype)
             for i in range(self.num_layers):
                 query_states, key_value_states = paddlenlp_ops.fused_rms_qkv_rope_t(
@@ -6860,13 +6906,33 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                 residual_input = out_linear_out
 
                 # Fused-OP-4 start
-                ffn2_out = paddlenlp_ops.fused_rms_mlp(
-                    out_linear_out,
-                    self.ffn_ln_scales[i],
-                    self.ffn1_weights[i],
-                    self.ffn2_weights[i],
-                    self._epsilon,
-                )
+                if self.config.moe_config.use_moe(i):
+                    tmp_out = fused_rms_norm(
+                        out_linear_out,
+                        norm_weight=self.ffn_ln_scales[i],
+                        norm_bias=self.ffn_ln_biases[i],
+                        epsilon=self._epsilon,
+                        begin_norm_axis=2,
+                        bias=self.linear_biases[i],
+                        residual=residual_input,
+                    )[0]
+
+                    # fused_expert_moe
+                    ffn2_out = self.baseline_moe(tmp_out, i)
+
+                    # shared_expert
+                    if self.config.moe_config.use_shared_expert(i):
+                        shared_expert_out = self.compute_shared_expert(tmp_out, i)
+                        ffn2_out = ffn2_out + shared_expert_out
+
+                else:
+                    ffn2_out = paddlenlp_ops.fused_rms_mlp(
+                        out_linear_out,
+                        self.ffn_ln_scales[i],
+                        self.ffn1_weights[i],
+                        self.ffn2_weights[i],
+                        self._epsilon,
+                    )
                 # Fused-OP-4 end
 
                 # all_reduce
@@ -6874,7 +6940,6 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     dist.all_reduce(ffn2_out)
                 # end LlamaDecoderLayer
         elif is_prompt is False:
-            residual_input = src
             ffn2_out = paddle.zeros_like(src, src.dtype)
             for i in range(self.num_layers):
                 out_linear_out = paddlenlp_ops.fused_block_attention(
@@ -6904,14 +6969,37 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     dist.all_reduce(out_linear_out)
 
                 # Fused-OP-4 start
-                ffn2_out = paddlenlp_ops.fused_rms_mlp_res(
-                    out_linear_out,
-                    self.ffn_ln_scales[i],
-                    self.ffn1_weights[i],
-                    self.ffn2_weights[i],
-                    residual_input,
-                    self._epsilon,
-                )
+                if self.config.moe_config.use_moe(i):
+                    out_linear_out = residual_input + out_linear_out
+                    residual_input = out_linear_out
+
+                    tmp_out = fused_rms_norm(
+                        out_linear_out,
+                        norm_weight=self.ffn_ln_scales[i],
+                        norm_bias=self.ffn_ln_biases[i],
+                        epsilon=self._epsilon,
+                        begin_norm_axis=2,
+                        bias=self.linear_biases[i],
+                        residual=residual_input,
+                    )[0]
+
+                    # fused_expert_moe
+                    ffn2_out = self.baseline_moe(tmp_out, i)
+
+                    # shared_expert
+                    if self.config.moe_config.use_shared_expert(i):
+                        shared_expert_out = self.compute_shared_expert(tmp_out, i)
+                        ffn2_out = ffn2_out + shared_expert_out
+
+                else:
+                    ffn2_out = paddlenlp_ops.fused_rms_mlp_res(
+                        out_linear_out,
+                        self.ffn_ln_scales[i],
+                        self.ffn1_weights[i],
+                        self.ffn2_weights[i],
+                        residual_input,
+                        self._epsilon,
+                    )
                 # Fused-OP-4 end
 
                 # all_reduce
