@@ -6774,6 +6774,63 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
         super().__init__(config)
 
         self.config = config
+        self.use_fused_moe = True
+
+    def fused_moe(self, hidden_states, i):
+        ep_rank = 0
+        ep_size = 1
+        ep_slice_num = 1
+        slice_max_expert = self.config.moe_config.num_experts // ep_slice_num
+        experts_per_rank = self.config.moe_config.num_experts // ep_size
+        experts_min = ep_rank * experts_per_rank
+        experts_max = (ep_rank + 1) * experts_per_rank - 1
+        if ep_rank == ep_size - 1:
+            experts_max = self.config.moe_config.num_experts - 1
+
+        expert_slice = max(
+            1, (experts_max - experts_min + 1) // slice_max_expert
+        )
+        expert_chunk = max(
+            1, (experts_max - experts_min + 1) // expert_slice
+        )
+
+        from paddlenlp_ops import mixture_of_experts as moe
+
+        _, _, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.reshape([-1, hidden_dim])
+
+        logits = paddle.matmul(hidden_states, self.gate_weights[i].cast("bfloat16"))
+        weights = paddle.nn.functional.softmax(logits, axis=-1)
+        routing_weights, selected_experts = paddle.topk(weights, self.config.moe_config.top_k, axis=-1)
+        common_inputs = (hidden_states, selected_experts, routing_weights)
+
+        final_hidden_states = paddle.zeros_like(hidden_states)
+
+        for idx in range(expert_slice):
+            slice_experts_min = experts_min + (expert_chunk * idx)
+            slice_experts_max = min(
+                slice_experts_min + expert_chunk - 1, experts_max
+            )
+
+            common_params = (
+                False, #permuted_weights
+                "silu", #activation,
+                slice_experts_min,
+                slice_experts_max,
+            )
+            up_gate_weights = [self.ffn1_weights[i][j] for j in range(self.ffn1_weights[i].shape[0])]
+            down_weights = [self.ffn2_weights[i][j] for j in range(self.ffn2_weights[i].shape[0])]
+            slice_weights = (
+                up_gate_weights[slice_experts_min : slice_experts_max + 1],
+                down_weights[slice_experts_min : slice_experts_max + 1],
+            )
+
+            slice_result, _ = moe(
+                *common_inputs, *slice_weights, *common_params, False
+            )
+            final_hidden_states += slice_result
+
+        return final_hidden_states
 
     def forward(
         self,
@@ -6914,7 +6971,10 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     )[0]
 
                     # fused_expert_moe
-                    ffn2_out = baseline_moe(tmp_out, i)
+                    if self.use_fused_moe:
+                        ffn2_out = self.fused_moe(tmp_out, i)
+                    else:
+                        ffn2_out = baseline_moe(tmp_out, i)
 
                     # shared_expert
                     if self.config.moe_config.use_shared_expert(i):
@@ -6980,7 +7040,10 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     )[0]
 
                     # fused_expert_moe
-                    ffn2_out = baseline_moe(tmp_out, i)
+                    if self.use_fused_moe:
+                        ffn2_out = self.fused_moe(tmp_out, i)
+                    else:
+                        ffn2_out = baseline_moe(tmp_out, i)
 
                     # shared_expert
                     if self.config.moe_config.use_shared_expert(i):
