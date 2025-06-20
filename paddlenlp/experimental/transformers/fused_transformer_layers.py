@@ -6796,7 +6796,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
 
         from paddlenlp_ops import mixture_of_experts as moe
 
-        _, _, hidden_dim = hidden_states.shape
+        batch, _, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape([-1, hidden_dim])
 
         logits = paddle.matmul(hidden_states, self.gate_weights[i].cast("bfloat16"))
@@ -6830,6 +6830,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
             )
             final_hidden_states += slice_result
 
+        final_hidden_states = final_hidden_states.reshape([batch, -1, hidden_dim])
         return final_hidden_states
 
     def forward(
