@@ -34,7 +34,6 @@ from paddlenlp.experimental.transformers.fused_transformer_layers import (
     FusedBlockMultiTransformer,
     FusedBlockMultiTransformerA8W8,
     FusedBlockMultiTransformerFP8,
-    FusedBlockMultiTransformerFP8HPU,
     FusedBlockMultiTransformerHPU,
     FusedBlockMultiTransformerWeightOnly,
     FusedMultiTransformerA8W8,
@@ -1402,20 +1401,16 @@ class LlamaBlockInferenceModel(LlamaInferenceModel):
         self.config = config
 
     def set_transformer_block(self, transformer_config):
-        if paddle.is_compiled_with_cuda():
-            if self.use_weight_only:
-                self.transformer_block = FusedBlockMultiTransformerWeightOnly(transformer_config)
-            elif self.quant_type == "a8w8" or self.quant_type == "a8w8c8":
-                self.transformer_block = FusedBlockMultiTransformerA8W8(transformer_config)
-            elif "fp8" in self.quant_type:
-                self.transformer_block = FusedBlockMultiTransformerFP8(transformer_config)
-            else:
-                self.transformer_block = FusedBlockMultiTransformer(transformer_config)
+        if self.use_weight_only:
+            self.transformer_block = FusedBlockMultiTransformerWeightOnly(transformer_config)
+        elif self.quant_type == "a8w8" or self.quant_type == "a8w8c8":
+            self.transformer_block = FusedBlockMultiTransformerA8W8(transformer_config)
+        elif "fp8" in self.quant_type:
+            self.transformer_block = FusedBlockMultiTransformerFP8(transformer_config)
         elif paddle.is_compiled_with_custom_device("intel_hpu"):
-            if "fp8" in self.quant_type:
-                self.transformer_block = FusedBlockMultiTransformerFP8HPU(transformer_config)
-            else:
-                self.transformer_block = FusedBlockMultiTransformerHPU(transformer_config)
+            self.transformer_block = FusedBlockMultiTransformerHPU(transformer_config)
+        else:
+            self.transformer_block = FusedBlockMultiTransformer(transformer_config)
 
     def remove_padding(self, input_ids, seq_lens_this_time, draft_tokens=None, seq_lens_encoder=None):
         cum_offsets_now = paddle.cumsum(self.max_seq_len - seq_lens_this_time)

@@ -6787,12 +6787,16 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
         if ep_rank == ep_size - 1:
             experts_max = self.config.moe_config.num_experts - 1
 
-        expert_slice = max(1, (experts_max - experts_min + 1) // slice_max_expert)
-        expert_chunk = max(1, (experts_max - experts_min + 1) // expert_slice)
+        expert_slice = max(
+            1, (experts_max - experts_min + 1) // slice_max_expert
+        )
+        expert_chunk = max(
+            1, (experts_max - experts_min + 1) // expert_slice
+        )
 
         from paddlenlp_ops import mixture_of_experts as moe
 
-        _, _, hidden_dim = hidden_states.shape
+        batch, _, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape([-1, hidden_dim])
 
         logits = paddle.matmul(hidden_states, self.gate_weights[i].cast("bfloat16"))
@@ -6804,11 +6808,13 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
 
         for idx in range(expert_slice):
             slice_experts_min = experts_min + (expert_chunk * idx)
-            slice_experts_max = min(slice_experts_min + expert_chunk - 1, experts_max)
+            slice_experts_max = min(
+                slice_experts_min + expert_chunk - 1, experts_max
+            )
 
             common_params = (
-                False,  # permuted_weights
-                "silu",  # activation,
+                False, #permuted_weights
+                "silu", #activation,
                 slice_experts_min,
                 slice_experts_max,
             )
@@ -6819,9 +6825,12 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                 down_weights[slice_experts_min : slice_experts_max + 1],
             )
 
-            slice_result, _ = moe(*common_inputs, *slice_weights, *common_params, False)
+            slice_result, _ = moe(
+                *common_inputs, *slice_weights, *common_params, False
+            )
             final_hidden_states += slice_result
 
+        final_hidden_states = final_hidden_states.reshape([batch, -1, hidden_dim])
         return final_hidden_states
 
     def forward(
@@ -6870,8 +6879,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
             final_hidden_states = paddle.zeros_like(hidden_states)
 
             expert_mask = paddle.transpose(
-                paddle.nn.functional.one_hot(selected_experts, num_classes=self.config.moe_config.num_experts),
-                [2, 1, 0],
+                paddle.nn.functional.one_hot(selected_experts, num_classes=self.config.moe_config.num_experts), [2, 1, 0]
             )
 
             for expert_id in range(self.config.moe_config.num_experts):
@@ -7064,428 +7072,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
         kwargs["multi_block_output"] = multi_block_output
         kwargs["input_ids"] = input_ids
 
-        # post process
-        batch_ids = kwargs.get("batch_ids", None)
-        seq_lens_encoder = kwargs.get("seq_lens_encoder", None)
-        out = paddlenlp_ops.rebuild_padding_v2(
-            multi_block_output,
-            batch_ids,
-            seq_lens_encoder,
-            is_prompt,
-        )
-        return out, caches
-
-
-class FusedBlockMultiTransformerFP8HPU(FusedBlockMultiTransformerFP8):
-    def __init__(self, config: FusedMultiTransformerConfig):
-        super().__init__(config)
-
-        self.config = config
-        self.use_fused_moe = True
-
-    def fused_moe(self, hidden_states, i):
-        ep_rank = 0
-        ep_size = 1
-        ep_slice_num = 1
-        slice_max_expert = self.config.moe_config.num_experts // ep_slice_num
-        experts_per_rank = self.config.moe_config.num_experts // ep_size
-        experts_min = ep_rank * experts_per_rank
-        experts_max = (ep_rank + 1) * experts_per_rank - 1
-        if ep_rank == ep_size - 1:
-            experts_max = self.config.moe_config.num_experts - 1
-
-        expert_slice = max(1, (experts_max - experts_min + 1) // slice_max_expert)
-        expert_chunk = max(1, (experts_max - experts_min + 1) // expert_slice)
-
-        from paddlenlp_ops import mixture_of_experts as moe
-
-        _, _, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.reshape([-1, hidden_dim])
-
-        logits = paddle.matmul(hidden_states, self.gate_weights[i].cast("bfloat16"))
-        weights = paddle.nn.functional.softmax(logits, axis=-1)
-        routing_weights, selected_experts = paddle.topk(weights, self.config.moe_config.top_k, axis=-1)
-        common_inputs = (hidden_states, selected_experts, routing_weights)
-
-        final_hidden_states = paddle.zeros_like(hidden_states)
-
-        for idx in range(expert_slice):
-            slice_experts_min = experts_min + (expert_chunk * idx)
-            slice_experts_max = min(slice_experts_min + expert_chunk - 1, experts_max)
-
-            common_params = (
-                False,  # permuted_weights
-                "silu",  # activation,
-                slice_experts_min,
-                slice_experts_max,
-            )
-            up_gate_weights = [self.ffn1_weights[i][j] for j in range(self.ffn1_weights[i].shape[0])]
-            down_weights = [self.ffn2_weights[i][j] for j in range(self.ffn2_weights[i].shape[0])]
-            slice_weights = (
-                up_gate_weights[slice_experts_min : slice_experts_max + 1],
-                down_weights[slice_experts_min : slice_experts_max + 1],
-            )
-
-            slice_result, _ = moe(*common_inputs, *slice_weights, *common_params, False)
-            final_hidden_states += slice_result
-
-        return final_hidden_states
-
-    def forward(
-        self,
-        input_ids,
-        src,
-        cum_offsets=None,
-        padding_offset=None,
-        attn_mask=None,
-        caches=None,
-        pre_caches=None,
-        pre_caches_length=0,
-        rotary_embs=None,
-        rotary_emb_dims=0,
-        seq_lens=None,
-        time_step=None,
-        **kwargs,
-    ):
-        if caches is not None:
-            assert len(caches) == len(self.qkv_weights) or len(caches) == 2 * len(self.qkv_weights)
-
-        assert self.num_layers == len(self.qkv_weights)
-
-        block_size = kwargs.get("block_size", None)
-        block_indices = kwargs.get("block_indices", None)
-        block_groups = kwargs.get("block_groups", None)
-        block_list = kwargs.get("block_list", None)
-        block_offsets = kwargs.get("block_offsets", None)
-        block_mapping = kwargs.get("block_mapping", None)
-        block_bias = kwargs.get("block_bias", None)
-        is_prompt = kwargs.get("is_prompt", None)
-
-        if len(src.shape) == 2:
-            src = src.unsqueeze(axis=1)
-
-        import paddlenlp_ops
-
-        def baseline_moe(hidden_states, i):
-            batch_size, seq_len, hidden_dim = hidden_states.shape
-            hidden_states = hidden_states.reshape([-1, hidden_dim])
-
-            # !!! gate_weights 在 set_state_dict 时被 cast 成了 float32
-            logits = paddle.matmul(hidden_states, self.gate_weights[i].cast("bfloat16"))
-            weights = paddle.nn.functional.softmax(logits, axis=-1)
-            routing_weights, selected_experts = paddle.topk(weights, self.config.moe_config.top_k, axis=-1)
-            final_hidden_states = paddle.zeros_like(hidden_states)
-
-            expert_mask = paddle.transpose(
-                paddle.nn.functional.one_hot(selected_experts, num_classes=self.config.moe_config.num_experts),
-                [2, 1, 0],
-            )
-
-            for expert_id in range(self.config.moe_config.num_experts):
-                idx, top_x = paddle.where(expert_mask[expert_id])
-                if idx.size == 0:
-                    continue
-                current_state = hidden_states[top_x]
-                current_state = paddlenlp_ops.fused_mlp(
-                    current_state, self.ffn1_weights[i][expert_id], None, self.ffn2_weights[i][expert_id]
-                )
-
-                current_state = current_state.reshape([-1, hidden_dim])
-                current_hidden_states = current_state * routing_weights[top_x, idx]
-
-                for idx, pos in enumerate(top_x):
-                    final_hidden_states[pos.item()] += current_hidden_states[idx]
-
-            final_hidden_states = paddle.reshape(final_hidden_states, [batch_size, seq_len, hidden_dim])
-            return final_hidden_states
-
-        def compute_shared_expert(tmp_out, i):
-            ffn2_out = paddlenlp_ops.fused_mlp(
-                tmp_out, self.shared_expert_ffn1_weights[i], None, self.shared_expert_ffn2_weights[i]
-            )
-            if self.config.moe_config.shared_expert_with_gate:
-                gate_out = paddle.matmul(tmp_out, self.shared_expert_gate_weights[i])
-                gate_out = paddle.nn.functional.sigmoid(gate_out)
-                return gate_out * ffn2_out
-            return ffn2_out
-
-        residual_input = src
-        global infer_round
-
-        if is_prompt is True:  # context
-            ffn2_out = paddle.zeros_like(src, src.dtype)
-            for i in range(self.num_layers):
-                scale_one = paddle.to_tensor([1.0], dtype=paddle.float32)
-                qkv_weight_scale = paddle.to_tensor(
-                    [self.weight_scales["qkv_weight_scale"][i] / (self.act_scales["qkv_in_scale"][i] * 240 * 240)],
-                    dtype=paddle.float32,
-                )
-                qkv_in_scale = paddle.to_tensor([self.act_scales["qkv_in_scale"][i] * 240], dtype=paddle.float32)
-
-                query_states, key_value_states = paddlenlp_ops.fused_fp8_rms_qkv_rope_t(
-                    ffn2_out,
-                    self.ln_scales[i],
-                    self.qkv_weights[i],
-                    self.qkv_biases[i],
-                    rotary_embs,
-                    residual_input,
-                    qkv_in_scale,
-                    qkv_weight_scale,
-                    self._epsilon,
-                    self.head_dim,
-                    self.num_heads,
-                )
-                # Fused-OP-1 end
-
-                # Fused-OP-2 start
-                # write cache kv (inplace)
-                #         [2, 8,   384, 32, 128]
-                #         [2, 8, 6, 64, 32, 128]
-                #         [2, 48,   64, 32, 128]
-                #   --> [64][512,   64, 32, 128]
-                kv, B, BP_BS, M, H = key_value_states.shape
-                key_value_states_reshape = key_value_states.reshape([kv, -1, block_size, M, H])
-                key_states = key_value_states_reshape[0]
-                value_states = key_value_states_reshape[1]
-                k_cache = caches[2 * i]
-                v_cache = caches[2 * i + 1]
-                paddlenlp_ops.index_copy_(k_cache, block_indices, key_states, 0)
-                paddlenlp_ops.index_copy_(v_cache, block_indices, value_states, 0)
-
-                out_linear_in_scale = paddle.to_tensor(
-                    [self.act_scales["out_linear_in_scale"][i] * 240], dtype=paddle.float32
-                )
-                linear_weight_scale = paddle.to_tensor(
-                    [
-                        self.weight_scales["out_linear_weight_scale"][i]
-                        / (self.act_scales["out_linear_in_scale"][i] * 240 * 240)
-                    ],
-                    dtype=paddle.float32,
-                )
-
-                out_linear_out = paddlenlp_ops.fused_fp8_sdpa_proj_t(
-                    query_states,
-                    key_value_states,
-                    attn_mask,
-                    None,
-                    self.linear_weights[i],
-                    scale_one,
-                    scale_one,
-                    scale_one,
-                    scale_one,
-                    scale_one,
-                    scale_one,
-                    out_linear_in_scale,
-                    linear_weight_scale,
-                    scaling_factor=self.head_dim**-0.5,
-                    causal=True,
-                )
-                # Fused-OP-2 end
-
-                # all_reduce
-                if self.tp_degree > 1:
-                    dist.all_reduce(out_linear_out)
-                out_linear_out = residual_input + out_linear_out
-                residual_input = out_linear_out
-
-                # Fused-OP-4 start
-                if self.config.moe_config.use_moe(i):
-                    tmp_out = fused_rms_norm(
-                        out_linear_out,
-                        norm_weight=self.ffn_ln_scales[i],
-                        norm_bias=self.ffn_ln_biases[i],
-                        epsilon=self._epsilon,
-                        begin_norm_axis=2,
-                        bias=self.linear_biases[i],
-                        residual=residual_input,
-                    )[0]
-
-                    # fused_expert_moe
-                    if self.use_fused_moe:
-                        ffn2_out = self.fused_moe(tmp_out, i)
-                    else:
-                        ffn2_out = baseline_moe(tmp_out, i)
-
-                    # shared_expert
-                    if self.config.moe_config.use_shared_expert(i):
-                        shared_expert_out = compute_shared_expert(tmp_out, i)
-                        ffn2_out = ffn2_out + shared_expert_out
-
-                else:
-                    ffn2_out = paddlenlp_ops.fused_fp8_rms_mlp(
-                        out_linear_out,
-                        self.ffn_ln_scales[i],
-                        self.ffn1_0_weights[i],
-                        self.ffn1_1_weights[i],
-                        self.ffn2_weights[i],
-                        paddle.to_tensor([self.act_scales["ffn1_in_scale"][i] * 240], dtype=paddle.float32),
-                        paddle.to_tensor(
-                            [
-                                self.weight_scales["ffn1_0_weight_scale"][i]
-                                / (self.act_scales["ffn1_in_scale"][i] * 240 * 240)
-                            ],
-                            dtype=paddle.float32,
-                        ),
-                        paddle.to_tensor(
-                            [
-                                self.weight_scales["ffn1_1_weight_scale"][i]
-                                / (self.act_scales["ffn1_in_scale"][i] * 240 * 240)
-                            ],
-                            dtype=paddle.float32,
-                        ),
-                        paddle.to_tensor([self.act_scales["ffn2_in_scale"][i] * 240], dtype=paddle.float32),
-                        paddle.to_tensor(
-                            [
-                                self.weight_scales["ffn2_weight_scale"][i]
-                                / (self.act_scales["ffn2_in_scale"][i] * 240 * 240)
-                            ],
-                            dtype=paddle.float32,
-                        ),
-                        self._epsilon,
-                    )
-                # Fused-OP-4 end
-
-                # all_reduce
-                if self.tp_degree > 1:
-                    dist.all_reduce(ffn2_out)
-                # end LlamaDecoderLayer
-
-        elif is_prompt is False:
-            ffn2_out = paddle.zeros_like(src, src.dtype)
-            for i in range(self.num_layers):
-                scale_one = paddle.to_tensor([1.0], dtype=paddle.float32)
-                qkv_in_scale = paddle.to_tensor([self.act_scales["qkv_in_scale"][i] * 240], dtype=paddle.float32)
-                qkv_weight_scale = paddle.to_tensor(
-                    [self.weight_scales["qkv_weight_scale"][i] / (self.act_scales["qkv_in_scale"][i] * 240 * 240)],
-                    dtype=paddle.float32,
-                )
-
-                query_states, key_value_states = paddlenlp_ops.fused_fp8_rms_qkv_rope_t(
-                    ffn2_out,
-                    self.ln_scales[i],
-                    self.qkv_weights[i],
-                    self.qkv_biases[i],
-                    rotary_embs,
-                    residual_input,
-                    qkv_in_scale,
-                    qkv_weight_scale,
-                    self._epsilon,
-                    self.head_dim,
-                    self.num_heads,
-                )
-                key_states = key_value_states[0].squeeze(1)
-                value_states = key_value_states[1].squeeze(1)
-                k_cache = caches[2 * i]
-                v_cache = caches[2 * i + 1]
-                k_cache.index_put_((block_indices, block_offsets), key_states)
-                v_cache.index_put_((block_indices, block_offsets), value_states)
-
-                out_linear_in_scale = paddle.to_tensor(
-                    [self.act_scales["out_linear_in_scale"][i] * 240], dtype=paddle.float32
-                )
-                weight_scale = paddle.to_tensor(
-                    [
-                        self.weight_scales["out_linear_weight_scale"][i]
-                        / (self.act_scales["out_linear_in_scale"][i] * 240 * 240)
-                    ],
-                    dtype=paddle.float32,
-                )
-
-                # check the logic of flatpa_proj for parameter 2, 3 scaling
-                out_linear_out = paddlenlp_ops.fused_fp8_flatpa_proj(
-                    query_states,
-                    caches[2 * i],
-                    caches[2 * i + 1],
-                    block_groups,
-                    block_list,
-                    block_mapping,
-                    block_bias,
-                    self.linear_weights[i],
-                    scale_one,
-                    scale_one,
-                    scale_one,
-                    scale_one,
-                    out_linear_in_scale,
-                    weight_scale,
-                    scaling_factor=self.head_dim**-0.5,
-                )
-
-                # all_reduce
-                if self.tp_degree > 1:
-                    dist.all_reduce(out_linear_out)
-
-                # Fused-OP-4 start
-                if self.config.moe_config.use_moe(i):
-                    out_linear_out = residual_input + out_linear_out
-                    residual_input = out_linear_out
-
-                    tmp_out = fused_rms_norm(
-                        out_linear_out,
-                        norm_weight=self.ffn_ln_scales[i],
-                        norm_bias=self.ffn_ln_biases[i],
-                        epsilon=self._epsilon,
-                        begin_norm_axis=2,
-                        bias=self.linear_biases[i],
-                        residual=residual_input,
-                    )[0]
-
-                    # fused_expert_moe
-                    if self.use_fused_moe:
-                        ffn2_out = self.fused_moe(tmp_out, i)
-                    else:
-                        ffn2_out = baseline_moe(tmp_out, i)
-
-                    # shared_expert
-                    if self.config.moe_config.use_shared_expert(i):
-                        shared_expert_out = compute_shared_expert(tmp_out, i)
-                        ffn2_out = ffn2_out + shared_expert_out
-
-                else:
-                    ffn2_out = paddlenlp_ops.fused_fp8_rms_mlp_res(
-                        out_linear_out,
-                        self.ffn_ln_scales[i],
-                        self.ffn1_0_weights[i],
-                        self.ffn1_1_weights[i],
-                        self.ffn2_weights[i],
-                        residual_input,
-                        paddle.to_tensor([self.act_scales["ffn1_in_scale"][i] * 240], dtype=paddle.float32),
-                        paddle.to_tensor(
-                            [
-                                self.weight_scales["ffn1_0_weight_scale"][i]
-                                / (self.act_scales["ffn1_in_scale"][i] * 240 * 240)
-                            ],
-                            dtype=paddle.float32,
-                        ),
-                        paddle.to_tensor(
-                            [
-                                self.weight_scales["ffn1_1_weight_scale"][i]
-                                / (self.act_scales["ffn1_in_scale"][i] * 240 * 240)
-                            ],
-                            dtype=paddle.float32,
-                        ),
-                        paddle.to_tensor([self.act_scales["ffn2_in_scale"][i] * 240], dtype=paddle.float32),
-                        paddle.to_tensor(
-                            [
-                                self.weight_scales["ffn2_weight_scale"][i]
-                                / (self.act_scales["ffn2_in_scale"][i] * 240 * 240)
-                            ],
-                            dtype=paddle.float32,
-                        ),
-                        self._epsilon,
-                    )
-                # Fused-OP-4 end
-
-                # all_reduce
-                if self.tp_degree > 1:
-                    dist.all_reduce(ffn2_out)
-                # end LlamaDecoderLayer
-
-        multi_block_output = residual_input + ffn2_out
-        kwargs["time_step"] = time_step
-        kwargs["multi_block_output"] = multi_block_output
-        kwargs["input_ids"] = input_ids
-
-        # post process
+        #post process
         batch_ids = kwargs.get("batch_ids", None)
         seq_lens_encoder = kwargs.get("seq_lens_encoder", None)
         out = paddlenlp_ops.rebuild_padding_v2(
