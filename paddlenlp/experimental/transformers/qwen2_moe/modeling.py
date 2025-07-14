@@ -826,6 +826,7 @@ class Qwen2MoeBlockInferenceModel(Qwen2MoeInferenceModel):
                 block_mapping,
                 attention_mask,
                 batch_ids,
+                total_batch,
                 is_prompt,
             ) = prepare_block_metadata(
                 input_ids,
@@ -848,6 +849,7 @@ class Qwen2MoeBlockInferenceModel(Qwen2MoeInferenceModel):
             kwargs["block_bias"] = attention_mask
             kwargs["block_size"] = self.block_size
             kwargs["batch_ids"] = batch_ids
+            kwargs["total_batch"] = total_batch.item()
             kwargs["is_prompt"] = is_prompt
         else:
             draft_tokens = kwargs.get("draft_tokens", None)
