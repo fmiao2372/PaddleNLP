@@ -6792,10 +6792,17 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
 
         from paddlenlp_ops import mixture_of_experts as moe
 
-        logits = paddle.matmul(hidden_states, self.gate_weights[i].cast("bfloat16"))
+        logits = paddle.matmul(hidden_states.cast("float32"), self.gate_weights[i])
         weights = paddle.nn.functional.softmax(logits, axis=-1)
-        routing_weights, selected_experts = paddle.topk(weights, self.config.moe_config.top_k, axis=-1)
-        common_inputs = (hidden_states, selected_experts, routing_weights)
+        if self.e_score_correction_biases[i] is not None:
+            scores = weights + self.e_score_correction_biases[i]
+            _, selected_experts = paddle.topk(scores, self.config.moe_config.top_k, axis=-1)
+            routing_weights = paddle.index_sample(weights, selected_experts)
+        else:
+            routing_weights, selected_experts = paddle.topk(weights, self.config.moe_config.top_k, axis=-1)
+        if self.config.moe_config.norm_topk_prob:
+            routing_weights /= paddle.sum(routing_weights, axis=-1, keepdim=True)
+        common_inputs = (hidden_states, selected_experts, routing_weights.cast("bfloat16"))
 
         final_hidden_states = paddle.zeros_like(hidden_states)
 
@@ -6957,6 +6964,10 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     residual=residual_input,
                 )
                 if self.config.moe_config.use_moe(i):
+                    if self.config.moe_config.topk_method not in ["greedy", None]:
+                        raise ValueError(
+                            f"Unsupported topk_method: {self.config.moe_config.topk_method}. Please choose 'greedy'."
+                        )
                     # fused_expert_moe
                     if self.use_fused_moe:
                         src = self.fused_moe(tmp_out, i)
