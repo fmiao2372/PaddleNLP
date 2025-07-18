@@ -6920,6 +6920,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     self.head_dim,
                     self.num_heads,
                     total_batch,
+                    transpose=True,
                 )
                 # Fused-OP-1 end
 
@@ -7020,6 +7021,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     self.head_dim,
                     self.num_heads,
                     scaling_factor=self.head_dim**-0.5,
+                    transpose=True,
                 )
 
                 # all_reduce
