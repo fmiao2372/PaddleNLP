@@ -6921,6 +6921,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     self.num_heads,
                     total_batch,
                     transpose=True,
+                    use_neox_style=True,
                 )
                 # Fused-OP-1 end
 
@@ -7022,6 +7023,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
                     self.num_heads,
                     scaling_factor=self.head_dim**-0.5,
                     transpose=True,
+                    use_neox_style=True,
                 )
 
                 # all_reduce
@@ -7075,6 +7077,7 @@ class FusedBlockMultiTransformerHPU(FusedBlockMultiTransformer):
         out = paddlenlp_ops.rebuild_padding_v2(
             multi_block_output,
             batch_ids,
+            total_batch,
             seq_lens_encoder,
             is_prompt,
         )
